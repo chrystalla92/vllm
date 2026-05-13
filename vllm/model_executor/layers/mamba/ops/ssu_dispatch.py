@@ -353,14 +353,16 @@ _mamba_ssu_backend: MambaSSUBackend | None = None
 
 def initialize_mamba_ssu_backend(
     mamba_config: MambaConfig,
-    kv_cache_config: KVCacheConfig,
+    kv_cache_config: KVCacheConfig | None = None,
 ) -> None:
     """Initialize the global Mamba SSU backend.
 
-    No-op if `kv_cache_config` contains no specs that call
-    selective_state_update.
+    No-op if `kv_cache_config` is provided and contains no specs that call
+    selective_state_update.  When `kv_cache_config` is ``None`` the check is
+    skipped and the backend is always registered (useful for CPU runner
+    initialisation which happens before the KV-cache is set up).
     """
-    if not any(
+    if kv_cache_config is not None and not any(
         isinstance(g.kv_cache_spec, MambaSpec)
         and g.kv_cache_spec.mamba_type in ("mamba1", "mamba2")
         for g in kv_cache_config.kv_cache_groups

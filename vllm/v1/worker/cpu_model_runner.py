@@ -94,6 +94,47 @@ class CPUModelRunner(GPUModelRunner):
             cpu_tl.sample_recovered_tokens_kernel
         )
 
+        # -------------------------------------------------------------------
+        # Mamba-2 CPU fallbacks
+        # Patch both the ops-module namespace *and* mamba_mixer2's own
+        # namespace (Python captures module-level imports at import time, so
+        # mamba_mixer2.causal_conv1d_fn is a separate reference from
+        # ops.causal_conv1d.causal_conv1d_fn and must be patched explicitly).
+        # -------------------------------------------------------------------
+        import vllm.model_executor.layers.mamba.mamba_mixer2 as _mamba_mixer2
+        import vllm.model_executor.layers.mamba.ops.causal_conv1d as _causal_conv1d
+        import vllm.model_executor.layers.mamba.ops.ssd_combined as _ssd_combined
+        from vllm.config.mamba import MambaBackendEnum, MambaConfig
+        from vllm.model_executor.layers.mamba.ops.cpu_mamba_ops import (
+            causal_conv1d_fn as cpu_causal_conv1d_fn,
+            causal_conv1d_update as cpu_causal_conv1d_update,
+            mamba_chunk_scan_combined_varlen as cpu_mamba_chunk_scan_combined_varlen,
+        )
+        from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+            initialize_mamba_ssu_backend,
+        )
+
+        # Patch the ops module namespaces
+        _causal_conv1d.causal_conv1d_fn = cpu_causal_conv1d_fn
+        _causal_conv1d.causal_conv1d_update = cpu_causal_conv1d_update
+        _ssd_combined.mamba_chunk_scan_combined_varlen = (
+            cpu_mamba_chunk_scan_combined_varlen
+        )
+
+        # Patch mamba_mixer2's own (already-bound) references
+        _mamba_mixer2.causal_conv1d_fn = cpu_causal_conv1d_fn
+        _mamba_mixer2.causal_conv1d_update = cpu_causal_conv1d_update
+        _mamba_mixer2.mamba_chunk_scan_combined_varlen = (
+            cpu_mamba_chunk_scan_combined_varlen
+        )
+
+        # Register the CPU SSU backend for the Mamba decode path.
+        # kv_cache_config is not yet available here, so we pass None to skip
+        # the spec-check guard and force registration.  CPUModelRunner's
+        # initialize_kv_cache() will re-confirm this backend after the
+        # KV-cache is fully configured.
+        initialize_mamba_ssu_backend(MambaConfig(backend=MambaBackendEnum.CPU))
+
     @instrument(span_name="Loading (CPU)")
     def load_model(self, load_dummy_weights: bool = False) -> None:
         if load_dummy_weights:
@@ -128,6 +169,18 @@ class CPUModelRunner(GPUModelRunner):
         is_profiling: bool = False,
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, is_profiling)
+
+        # Re-register the CPU SSU backend now that kv_cache_config is known.
+        # super().initialize_kv_cache() calls initialize_mamba_ssu_backend()
+        # with the GPU/Triton backend; we override that here.
+        from vllm.config.mamba import MambaBackendEnum, MambaConfig
+        from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+            initialize_mamba_ssu_backend,
+        )
+
+        initialize_mamba_ssu_backend(
+            MambaConfig(backend=MambaBackendEnum.CPU), kv_cache_config
+        )
 
         if self.speculative_config:
             if self.speculative_config.use_eagle():
