@@ -181,9 +181,171 @@ class FlashInferSSUBackend(MambaSSUBackend):
         )
 
 
+class CPUSSUBackend(MambaSSUBackend):
+    """Pure-PyTorch SSU backend for CPU platforms.
+
+    Implements the SSM selective state update (decode step) without any
+    GPU-specific or Triton dependencies.
+
+    The computation follows:
+        dt  = softplus(dt + dt_bias)   [if dt_softplus]
+        dA  = exp(dt * A)
+        dB  = dt * B
+        new_state = dA * state + dB * x
+        y   = (new_state * C).sum(-1) + D * x
+    """
+
+    @property
+    def name(self) -> str:
+        return "cpu"
+
+    def __call__(
+        self,
+        state: torch.Tensor,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor,
+        dt_bias: torch.Tensor,
+        z: torch.Tensor | None = None,
+        dt_softplus: bool = False,
+        state_batch_indices: torch.Tensor | None = None,
+        dst_state_batch_indices: torch.Tensor | None = None,
+        null_block_id: int = NULL_BLOCK_ID,
+        out: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        is_blackwell: bool = False,
+    ) -> None:
+        import torch.nn.functional as F
+
+        # Normalise all inputs to 4-D / per-head form, matching the Triton
+        # wrapper's convention:
+        #   state   : (total_slots_or_batch, nheads, dim, dstate)
+        #   x/dt    : (batch, nheads, dim)
+        #   A       : (nheads, dim, dstate)
+        #   B/C     : (batch, ngroups, dstate)
+        #   D       : (nheads, dim)
+        #   dt_bias : (nheads, dim)
+        #   out     : (batch, nheads, dim)
+        if state.dim() == 3:
+            state = state.unsqueeze(1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        if dt.dim() == 2:
+            dt = dt.unsqueeze(1)
+        if A.dim() == 2:
+            A = A.unsqueeze(0)
+        if B.dim() == 2:
+            B = B.unsqueeze(1)
+        if C.dim() == 2:
+            C = C.unsqueeze(1)
+        if D.dim() == 1:
+            D = D.unsqueeze(0)
+        if dt_bias.dim() == 1:
+            dt_bias = dt_bias.unsqueeze(0)
+        if out is not None and out.dim() == 2:
+            out = out.unsqueeze(1)
+        if state_batch_indices is not None and state_batch_indices.dim() == 1:
+            state_batch_indices = state_batch_indices.unsqueeze(1)
+        if dst_state_batch_indices is not None and dst_state_batch_indices.dim() == 1:
+            dst_state_batch_indices = dst_state_batch_indices.unsqueeze(1)
+        if dst_state_batch_indices is None:
+            dst_state_batch_indices = state_batch_indices
+
+        batch = x.shape[0]
+        _, nheads, dim, dstate = state.shape
+        ngroups = B.shape[1]
+        heads_per_group = nheads // ngroups
+
+        # Cast to float32 for numerically stable computation.
+        compute_dtype = torch.float32
+        x_f = x.to(compute_dtype)
+        dt_f = dt.to(compute_dtype)
+        A_f = A.to(compute_dtype)
+        B_f = B.to(compute_dtype)
+        C_f = C.to(compute_dtype)
+        D_f = D.to(compute_dtype)
+        dt_bias_f = dt_bias.to(compute_dtype)
+
+        # 1. Discretise dt.
+        dt_f = dt_f + dt_bias_f.unsqueeze(0)  # (batch, nheads, dim)
+        if dt_softplus:
+            dt_f = F.softplus(dt_f)
+
+        def _ssm_step(
+            state_chunk: torch.Tensor,  # (n, nheads, dim, dstate)
+            x_chunk: torch.Tensor,      # (n, nheads, dim)
+            dt_chunk: torch.Tensor,     # (n, nheads, dim)
+            B_chunk: torch.Tensor,      # (n, ngroups, dstate)
+            C_chunk: torch.Tensor,      # (n, ngroups, dstate)
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Return (new_state, y) for a subset of the batch."""
+            # Expand B/C from group-level to head-level.
+            # (n, ngroups, dstate) -> (n, nheads, dstate)
+            B_h = B_chunk.repeat_interleave(heads_per_group, dim=1)
+            C_h = C_chunk.repeat_interleave(heads_per_group, dim=1)
+
+            # 2. dA = exp(dt * A)  ->  (n, nheads, dim, dstate)
+            dA = torch.exp(
+                dt_chunk.unsqueeze(-1) * A_f.unsqueeze(0)
+            )
+
+            # 3. dB = dt * B  ->  (n, nheads, dim, dstate)
+            #    B is shared across `dim`, so unsqueeze the dim axis.
+            dB = dt_chunk.unsqueeze(-1) * B_h.unsqueeze(2)
+
+            # 4. new_state = dA * state + dB * x
+            new_s = dA * state_chunk + dB * x_chunk.unsqueeze(-1)
+
+            # 5. y = (new_state * C).sum(-1) + D * x
+            y = (new_s * C_h.unsqueeze(2)).sum(-1) + D_f.unsqueeze(0) * x_chunk
+
+            return new_s, y
+
+        if state_batch_indices is not None:
+            # Paged KV-cache path: state is (total_slots, nheads, dim, dstate).
+            # Use the first column of state_batch_indices for decode (seqlen=1).
+            src_idx = state_batch_indices[:batch, 0]  # (batch,)
+            dst_idx = dst_state_batch_indices[:batch, 0]  # (batch,)
+
+            valid_mask = src_idx != null_block_id
+
+            if valid_mask.any():
+                v_src = src_idx[valid_mask]
+                v_dst = dst_idx[valid_mask]
+
+                gathered = state[v_src].to(compute_dtype)
+
+                new_s, y = _ssm_step(
+                    gathered,
+                    x_f[valid_mask],
+                    dt_f[valid_mask],
+                    B_f[valid_mask],
+                    C_f[valid_mask],
+                )
+
+                # Write updated state back into the paged cache.
+                state[v_dst] = new_s.to(state.dtype)
+
+                if out is not None:
+                    out[valid_mask] = y.to(out.dtype)
+        else:
+            # Non-paged path: state is (batch, nheads, dim, dstate).
+            state_f = state.to(compute_dtype)
+            new_s, y = _ssm_step(state_f, x_f, dt_f, B_f, C_f)
+
+            state.copy_(new_s.to(state.dtype))
+            if out is not None:
+                out.copy_(y.to(out.dtype))
+
+
 _BACKEND_REGISTRY: dict[MambaBackendEnum, type[MambaSSUBackend]] = {
     MambaBackendEnum.TRITON: TritonSSUBackend,
     MambaBackendEnum.FLASHINFER: FlashInferSSUBackend,
+    MambaBackendEnum.CPU: CPUSSUBackend,
 }
 
 _mamba_ssu_backend: MambaSSUBackend | None = None
