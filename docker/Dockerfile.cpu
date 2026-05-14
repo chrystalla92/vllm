@@ -116,6 +116,9 @@ COPY . .
 
 RUN if [ "$GIT_REPO_CHECK" != 0 ]; then bash tools/check_repo.sh ; fi
 
+ARG VLLM_VERSION_OVERRIDE
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/vllm-workspace/.deps,sharing=locked \
