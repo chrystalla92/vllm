@@ -771,6 +771,21 @@ class GPUModelRunner(
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
 
+        # OPTIMIZATION: Pre-computed row offsets and scratch buffers for the
+        # decode fast-path in _prepare_inputs.
+        # In a pure-decode batch each request contributes exactly one token:
+        #   token_indices[i] = num_computed_tokens[i] + i * stride
+        # Pre-computing i*stride avoids per-step multiplication + allocation.
+        _token_ids_stride = max(self.max_model_len, self.max_encoder_len)
+        self._row_offsets_np = (
+            np.arange(self.max_num_reqs, dtype=np.int64) * _token_ids_stride
+        )
+        self._token_indices_scratch = np.empty(arange_size, dtype=np.int64)
+
+        # OPTIMIZATION: Pre-allocated scratch buffer for _get_cumsum_and_arange.
+        # np.cumsum supports out= so we avoid a heap allocation each call.
+        self._cu_num_tokens_scratch = np.empty(self.max_num_reqs, dtype=np.int32)
+
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
         # means this layer will perform attention using the keys and values
@@ -1615,11 +1630,15 @@ class GPUModelRunner(
         Equivalent to but faster than:
         np.concatenate([np.arange(n) for n in num_tokens])
         """
+        n = len(num_tokens)
+        # OPTIMIZATION: Write cumsum directly into the pre-allocated scratch
+        # buffer instead of allocating a fresh array on each call.
         # Step 1. [2, 5, 3] -> [2, 7, 10]
-        cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
-        total_num_tokens = cu_num_tokens[-1]
+        cu_out = self._cu_num_tokens_scratch[:n]
+        np.cumsum(num_tokens, dtype=cumsum_dtype, out=cu_out)
+        total_num_tokens = int(cu_out[-1])
         # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
-        cumsums_offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
+        cumsums_offsets = np.repeat(cu_out - num_tokens, num_tokens)
         # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         np.subtract(
             self.arange_np[:total_num_tokens],
@@ -1627,7 +1646,7 @@ class GPUModelRunner(
             out=arange_out[:total_num_tokens],
         )
 
-        return cu_num_tokens
+        return cu_out
 
     def _compute_prev_positions(self, num_reqs: int) -> None:
         """Build prev_positions mapping: current pos -> previous pos (-1 if new).
@@ -1840,21 +1859,60 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        # Get request indices.
-        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        # OPTIMIZATION: Pure-decode fast-path.
+        # When every request contributes exactly one token
+        # (total_num_scheduled_tokens == num_reqs) the following identities hold:
+        #   req_indices   = [0, 1, ..., num_reqs-1]  (identity — arange view)
+        #   cu_num_tokens = [1, 2, ..., num_reqs]     (arange+1 view)
+        #   query_pos     = [0, 0, ..., 0]            (all zeros)
+        #   token_indices = num_computed_tokens + row_offsets  (in-place add)
+        # This avoids np.repeat, np.cumsum, fancy indexing and several
+        # intermediate array allocations per step — significant for the
+        # decode-heavy workloads where this path runs on every step.
+        is_decode_only = total_num_scheduled_tokens == num_reqs
 
-        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
-        # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        cu_num_tokens = self._get_cumsum_and_arange(
-            num_scheduled_tokens, self.query_pos.np
-        )
+        if is_decode_only:
+            # Views into pre-existing arrays — zero allocations.
+            req_indices = self.arange_np[:num_reqs]
+            cu_num_tokens = self.arange_np[1 : num_reqs + 1]  # [1..num_reqs]
+            # query_pos must be zeroed; fill only the live slice.
+            self.query_pos.np[:num_reqs].fill(0)
+            # token_indices[i] = num_computed_tokens[i] + i * stride
+            # Written into pre-allocated scratch — no heap allocation.
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                self._row_offsets_np[:num_reqs],
+                out=self._token_indices_scratch[:num_reqs],
+            )
+            token_indices_tensor = torch.from_numpy(
+                self._token_indices_scratch[:num_reqs]
+            )
+        else:
+            # General path for mixed prefill/decode batches.
+            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
-        # Get positions.
-        positions_np = (
-            self.input_batch.num_computed_tokens_cpu[req_indices]
-            + self.query_pos.np[: cu_num_tokens[-1]]
-        )
+            # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
+            # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            cu_num_tokens = self._get_cumsum_and_arange(
+                num_scheduled_tokens, self.query_pos.np
+            )
+
+            # Get positions.
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + self.query_pos.np[: cu_num_tokens[-1]]
+            )
+
+            # Get token indices.
+            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # -> [0, 1, M, M+1, M+2, M+3, M+4, 2*M, 2*M+1, 2*M+2]
+            # where M is the max_model_len.
+            token_indices = (
+                positions_np
+                + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            )
+            token_indices_tensor = torch.from_numpy(token_indices)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1865,15 +1923,6 @@ class GPUModelRunner(
         # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
-
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-        )
-        token_indices_tensor = torch.from_numpy(token_indices)
 
         # NOTE(woosuk): We use torch.index_select instead of np.take here
         # because torch.index_select is much faster than np.take for large
@@ -1956,8 +2005,11 @@ class GPUModelRunner(
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
 
-        num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
-        num_tokens_np = np.array(num_tokens, dtype=np.int32)
+        # OPTIMIZATION: Replace O(N) Python list-comprehension + np.array()
+        # with a direct view into the pre-maintained int32 buffer.
+        # num_tokens_no_spec[i] is kept in sync with request.num_tokens in
+        # _update_states before _prepare_inputs is called.
+        num_tokens_np = self.input_batch.num_tokens_no_spec[:num_reqs]
 
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returning
