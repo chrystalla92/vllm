@@ -27,6 +27,7 @@ class MambaBackendEnum(Enum, metaclass=_MambaBackendEnumMeta):
 
     TRITON = "triton"
     FLASHINFER = "flashinfer"
+    CPU = "cpu"
 
 
 @config
@@ -54,8 +55,15 @@ class MambaConfig:
         return value
 
     def __post_init__(self):
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_cpu()
+            and self.backend == MambaBackendEnum.TRITON
+        ):
+            self.backend = MambaBackendEnum.CPU
+
         if self.enable_stochastic_rounding:
-            from vllm.platforms import current_platform
 
             if not current_platform.is_cuda():
                 raise ValueError(
