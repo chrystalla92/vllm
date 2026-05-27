@@ -521,6 +521,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
+        # Flag for CPU-specific forward dispatch
+        self._is_cpu = current_platform.is_cpu()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -660,11 +663,238 @@ class MambaMixer2(MambaBase, PluggableLayer):
         logger.debug("Mamba2 SSD kernel warmup completed for layer %s", self.prefix)
         torch.accelerator.empty_cache()
 
+    def conv_ssm_forward_cpu(
+        self,
+        projected_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """CPU-only forward path for conv + SSM, using pure PyTorch ops.
+
+        Handles prefill and/or decode using pure-PyTorch implementations.
+        Standard (non-APC) mode is fully supported; APC mode is handled
+        with a simplified final-state-only write.
+        """
+        from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+            causal_conv1d_torch,
+        )
+        from vllm.model_executor.layers.mamba.ops.cpu.mamba2 import (
+            causal_conv1d_decode_cpu,
+            mamba2_ssm_decode_cpu,
+            mamba2_ssm_prefill_varlen_cpu,
+        )
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        hidden_states_B_C, dt = torch.split(
+            projected_states[..., self.tped_intermediate_size:],
+            [self.tped_conv_size, self.tped_dt_size],
+            dim=-1,
+        )
+
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+
+        assert self.cache_config is not None
+        is_mamba_cache_all = self.cache_config.mamba_cache_mode == "all"
+
+        # ── Profile run ─────────────────────────────────────────────────────
+        if attn_metadata_raw is None:
+            # CPU needs no Triton warmup; zero the output and return.
+            output.zero_()
+            return
+
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata = attn_metadata_raw[self.prefix]
+        assert isinstance(attn_metadata, Mamba2AttentionMetadata)
+
+        # ── KV cache ────────────────────────────────────────────────────────
+        # CPU always needs conv_state in dim-first layout (slots, dim, state_len)
+        conv_state_raw = self.kv_cache[0]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state_raw.transpose(-1, -2).contiguous()
+        else:
+            conv_state = conv_state_raw
+        ssm_state = self.kv_cache[1]   # (slots, nheads_tped, headdim, dstate)
+
+        # ── Metadata ────────────────────────────────────────────────────────
+        num_prefills       = attn_metadata.num_prefills
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decodes        = attn_metadata.num_decodes
+        num_decode_tokens  = attn_metadata.num_decode_tokens
+        has_prefill = num_prefills > 0
+        has_decode  = num_decodes  > 0
+        num_actual_tokens = num_prefill_tokens + num_decode_tokens
+
+        state_indices_tensor_p = attn_metadata.state_indices_tensor_p
+        state_indices_tensor_d = attn_metadata.state_indices_tensor_d
+        has_initial_states_p   = attn_metadata.has_initial_states_p
+        prep_initial_states    = attn_metadata.prep_initial_states
+        query_start_loc_p      = attn_metadata.query_start_loc_p
+
+        # ── Split tokens by phase ───────────────────────────────────────────
+        hidden_states_B_C_d, hidden_states_B_C_p = torch.split(
+            hidden_states_B_C[:num_actual_tokens],
+            [num_decode_tokens, num_prefill_tokens],
+            dim=0,
+        )
+        dt_d, dt_p = torch.split(
+            dt[:num_actual_tokens],
+            [num_decode_tokens, num_prefill_tokens],
+            dim=0,
+        )
+        ssm_out_d, ssm_out_p = torch.split(
+            output[:num_actual_tokens],
+            [num_decode_tokens, num_prefill_tokens],
+            dim=0,
+        )
+
+        # ── Prefill ─────────────────────────────────────────────────────────
+        if has_prefill:
+            assert state_indices_tensor_p is not None
+            assert query_start_loc_p is not None
+
+            # Determine the final-state slot per sequence
+            if is_mamba_cache_all and hasattr(
+                attn_metadata, "block_idx_last_scheduled_token"
+            ):
+                _, blk_p = attn_metadata.block_idx_last_scheduled_token.split(
+                    [num_decodes, num_prefills], dim=0
+                )
+                final_state_slots_p = state_indices_tensor_p.gather(
+                    1, blk_p.unsqueeze(1)
+                ).squeeze(1)
+            else:
+                final_state_slots_p = state_indices_tensor_p[:, 0]
+
+            has_init = has_initial_states_p
+            if has_init is None:
+                has_init = hidden_states_B_C_p.new_zeros(
+                    num_prefills, dtype=torch.bool
+                )
+
+            # Causal convolution (CPU torch impl)
+            # causal_conv1d_torch expects x as (dim, cu_seqlen)
+            x_pconv = hidden_states_B_C_p.transpose(0, 1).contiguous()
+            conv_out_p = causal_conv1d_torch(
+                x=x_pconv,
+                weight=self.conv_weights,
+                bias=self.conv1d.bias,
+                conv_states=conv_state,
+                query_start_loc=query_start_loc_p,
+                cache_indices=final_state_slots_p,
+                has_initial_state=has_init,
+                activation=self.activation,
+            )
+            # (dim, cu_seqlen) → (num_prefill_tokens, dim)
+            hidden_states_B_C_p = conv_out_p.transpose(0, 1)[:num_prefill_tokens]
+
+            hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(
+                hidden_states_B_C_p
+            )
+
+            # Gather optional initial SSM states
+            initial_states: torch.Tensor | None = None
+            if has_initial_states_p is not None and prep_initial_states:
+                if is_mamba_cache_all and hasattr(
+                    attn_metadata, "block_idx_last_computed_token"
+                ):
+                    _, blk_comp_p = (
+                        attn_metadata.block_idx_last_computed_token.split(
+                            [num_decodes, num_prefills], dim=0
+                        )
+                    )
+                    init_slots = state_indices_tensor_p.gather(
+                        1, blk_comp_p.unsqueeze(1)
+                    ).squeeze(1)
+                else:
+                    init_slots = state_indices_tensor_p[:, 0]
+                initial_states = torch.where(
+                    has_initial_states_p[:, None, None, None],
+                    ssm_state[init_slots],
+                    ssm_state.new_zeros(1),
+                )
+
+            n_groups = self.n_groups // self.tp_size
+            mamba2_ssm_prefill_varlen_cpu(
+                x=hidden_states_p.view(
+                    num_prefill_tokens,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                ),
+                dt=dt_p,
+                A=self.A,
+                B=B_p.view(num_prefill_tokens, n_groups, -1),
+                C=C_p.view(num_prefill_tokens, n_groups, -1),
+                D=self.D,
+                dt_bias=self.dt_bias,
+                out=ssm_out_p.view(
+                    num_prefill_tokens,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                ),
+                query_start_loc=query_start_loc_p,
+                ssm_state=ssm_state,
+                state_indices=final_state_slots_p,
+                initial_states=initial_states,
+                dt_softplus=True,
+                dt_limit=(0.0, float("inf")),
+            )
+
+        # ── Decode ──────────────────────────────────────────────────────────
+        if has_decode:
+            assert state_indices_tensor_d is not None
+
+            conv_state_indices_d = state_indices_tensor_d[:, 0]
+            hidden_states_B_C_d = causal_conv1d_decode_cpu(
+                x=hidden_states_B_C_d,
+                conv_state=conv_state,
+                weight=self.conv_weights,
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                conv_state_indices=conv_state_indices_d,
+            )
+
+            hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
+                hidden_states_B_C_d
+            )
+
+            n_groups    = self.n_groups    // self.tp_size
+            nheads_tped = self.num_heads   // self.tp_size
+
+            # Expand scalars across headdim via stride-0 views (matches CUDA path)
+            A_d       = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size)
+            dt_d_exp  = dt_d[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias_e = self.dt_bias[:, None].expand(-1, self.head_dim)
+            D_d       = self.D[:, None].expand(-1, self.head_dim)
+
+            mamba2_ssm_decode_cpu(
+                ssm_state=ssm_state,
+                x=hidden_states_d.view(-1, nheads_tped, self.head_dim),
+                dt=dt_d_exp,
+                A=A_d,
+                B=B_d.view(-1, n_groups, self.ssm_state_size),
+                C=C_d.view(-1, n_groups, self.ssm_state_size),
+                D=D_d,
+                dt_bias=dt_bias_e,
+                out=ssm_out_d.view(-1, nheads_tped, self.head_dim),
+                state_batch_indices=state_indices_tensor_d,
+                dst_state_batch_indices=state_indices_tensor_d,
+                dt_softplus=True,
+                null_block_id=NULL_BLOCK_ID,
+            )
+
+        # Write back conv_state if we made a contiguous transposed copy
+        if not is_conv_state_dim_first():
+            conv_state_raw.copy_(conv_state.transpose(-1, -2))
+
     def conv_ssm_forward(
         self,
         projected_states: torch.Tensor,
         output: torch.Tensor,
     ):
+        # Dispatch to the CPU-only implementation when running on CPU
+        if self._is_cpu:
+            return self.conv_ssm_forward_cpu(projected_states, output)
+
         hidden_states_B_C, dt = torch.split(
             projected_states[..., self.tped_intermediate_size :],
             [self.tped_conv_size, self.tped_dt_size],

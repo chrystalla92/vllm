@@ -46,13 +46,39 @@ def _gelu_and_mul(
     return F.gelu(x[..., :d], approximate="none") * x[..., d:]
 
 
+def _relu2_no_mul(x: torch.Tensor) -> torch.Tensor:
+    """ReLU squared (non-gated): relu(x)^2, no gate multiplication."""
+    return F.relu(x).pow(2)
+
+
+def _silu_no_mul(x: torch.Tensor) -> torch.Tensor:
+    """SiLU without gated multiplication (non-gated MoE)."""
+    return F.silu(x)
+
+
+def _gelu_no_mul(x: torch.Tensor) -> torch.Tensor:
+    """GELU without gated multiplication (non-gated MoE)."""
+    return F.gelu(x, approximate="none")
+
+
+def _gelu_tanh_no_mul(x: torch.Tensor) -> torch.Tensor:
+    """GELU (tanh approximation) without gated multiplication (non-gated MoE)."""
+    return F.gelu(x, approximate="tanh")
+
+
 # Map activation names to their native forward functions.
 # Uses static methods or standalone functions to avoid instantiating CustomOp
 # classes, which would call get_current_vllm_config() before config is set.
 _CPU_MOE_ACT_FN: dict[MoEActivation, Callable[[torch.Tensor], torch.Tensor]] = {
+    # Gated activations (act_and_mul=True): input is 2× output size
     MoEActivation.SILU: lambda x: SiluAndMul(compile_native=False).forward_native(x),
     MoEActivation.SWIGLUOAI: _swigluoai_forward_native,
     MoEActivation.GELU: _gelu_and_mul,
+    # Non-gated activations (act_and_mul=False): input == output size
+    MoEActivation.RELU2_NO_MUL: _relu2_no_mul,
+    MoEActivation.SILU_NO_MUL: _silu_no_mul,
+    MoEActivation.GELU_NO_MUL: _gelu_no_mul,
+    MoEActivation.GELU_TANH_NO_MUL: _gelu_tanh_no_mul,
 }
 
 
@@ -280,6 +306,12 @@ class CPUFusedMOE:
         layer: torch.nn.Module,
     ) -> tuple[bool, str]:
         if not hasattr(torch.ops._C, "prepack_moe_weight"):
+            return False, "none"
+
+        # Non-gated activations (is_act_and_mul=False) are not supported by
+        # the C++ grouped GEMM kernel — fall back to the torch path.
+        moe_config = getattr(layer, "moe_config", None)
+        if moe_config is not None and not moe_config.is_act_and_mul:
             return False, "none"
 
         dtype = layer.w13_weight.dtype
