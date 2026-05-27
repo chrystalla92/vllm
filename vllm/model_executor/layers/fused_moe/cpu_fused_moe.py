@@ -46,13 +46,25 @@ def _gelu_and_mul(
     return F.gelu(x[..., :d], approximate="none") * x[..., d:]
 
 
+def _relu2_no_mul(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x).square()
+
+
 # Map activation names to their native forward functions.
 # Uses static methods or standalone functions to avoid instantiating CustomOp
 # classes, which would call get_current_vllm_config() before config is set.
 _CPU_MOE_ACT_FN: dict[MoEActivation, Callable[[torch.Tensor], torch.Tensor]] = {
+    # Gated activations (is_act_and_mul=True): split input in half, apply
+    # activation to first half and multiply by second half.
     MoEActivation.SILU: lambda x: SiluAndMul(compile_native=False).forward_native(x),
     MoEActivation.SWIGLUOAI: _swigluoai_forward_native,
     MoEActivation.GELU: _gelu_and_mul,
+    # Non-gated activations (is_act_and_mul=False): apply activation directly
+    # to the full input without splitting.
+    MoEActivation.SILU_NO_MUL: F.silu,
+    MoEActivation.GELU_NO_MUL: lambda x: F.gelu(x, approximate="none"),
+    MoEActivation.GELU_TANH_NO_MUL: lambda x: F.gelu(x, approximate="tanh"),
+    MoEActivation.RELU2_NO_MUL: _relu2_no_mul,
 }
 
 
@@ -279,6 +291,12 @@ class CPUFusedMOE:
         self,
         layer: torch.nn.Module,
     ) -> tuple[bool, str]:
+        # The grouped GEMM kernel assumes gated activations (is_act_and_mul=True)
+        # and enforces output_size_w13 == 2 * input_size_w2 internally.
+        # Non-gated MoE (is_act_and_mul=False) must use the torch fallback path.
+        if hasattr(layer, "moe_config") and not layer.moe_config.is_act_and_mul:
+            return False, "none"
+
         if not hasattr(torch.ops._C, "prepack_moe_weight"):
             return False, "none"
 

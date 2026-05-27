@@ -367,10 +367,13 @@ class FusedMoE(PluggableLayer):
         self.quant_method: FusedMoEMethodBase = _get_quant_method()
 
         if not self.moe_config.is_act_and_mul and not (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
+            current_platform.is_cuda_alike()
+            or current_platform.is_xpu()
+            or current_platform.is_cpu()
         ):
             raise NotImplementedError(
-                "is_act_and_mul=False is supported only for CUDA and XPU for now"
+                "is_act_and_mul=False is supported only for CUDA, XPU and CPU "
+                "for now"
             )
 
         if enable_eplb and not self.quant_method.supports_eplb:

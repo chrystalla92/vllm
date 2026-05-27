@@ -234,6 +234,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 _, n_w2, k_w2 = layer.w2_weight.size()
                 if (
                     envs.VLLM_CPU_SGL_KERNEL
+                    and self.moe.is_act_and_mul  # SGL kernel only supports gated activations
                     and check_cpu_sgl_kernel(n_w13, k_w13, dtype_w13)
                     and check_cpu_sgl_kernel(n_w2, k_w2, dtype_w2)
                 ):
