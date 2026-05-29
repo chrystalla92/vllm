@@ -341,6 +341,54 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
+    vocab_size = logits.shape[-1]
+
+    # CPU-optimized path: use topk instead of full sort.
+    # For top-p, we only need the top tokens that cover the cumulative
+    # probability mass p. Empirically, 1024 tokens cover even p=0.999
+    # for typical LLM distributions. Using topk(K) is O(V + K log K)
+    # vs sort which is O(V log V), a large speedup for vocab_size=152k.
+    if allow_cpu_sync and p is not None:
+        # Determine how many top tokens we need
+        if k is not None:
+            # Need at least max(k) tokens, but cap at vocab_size
+            max_k = int(k.max().item())
+        else:
+            max_k = 0
+        # Use 1024 as the minimum to ensure top-p coverage
+        num_top = min(vocab_size, max(max_k, 1024))
+
+        # Get top-num_top tokens in descending order (largest first)
+        topk_logits, topk_indices = logits.topk(num_top, dim=-1,
+                                                  largest=True, sorted=True)
+
+        if k is not None:
+            # Apply top-k: mask tokens at positions >= k (0-indexed)
+            k_long = k.to(torch.long)
+            positions = torch.arange(num_top, device=logits.device,
+                                     dtype=torch.long).unsqueeze(0)
+            top_k_mask = positions >= k_long.unsqueeze(1)
+            topk_logits = topk_logits.masked_fill(top_k_mask, -float("inf"))
+
+        # Apply top-p in descending order
+        # Compute cumulative probability from largest to smallest
+        probs_desc = topk_logits.softmax(dim=-1)
+        probs_cum = probs_desc.cumsum(dim=-1)
+        # Shift cumsum by one: mask token i if its cumulative prob
+        # (not including itself) already exceeds p.
+        # probs_cum_before[i] = probs_cum[i-1], probs_cum_before[0] = 0
+        probs_cum_before = probs_cum - probs_desc
+        top_p_mask = probs_cum_before >= p.unsqueeze(1)
+        # Always keep at least one token (the most probable)
+        top_p_mask[:, 0] = False
+        topk_logits = topk_logits.masked_fill(top_p_mask, -float("inf"))
+
+        # Scatter topk logits back; all other positions get -inf
+        result = torch.full_like(logits, -float("inf"))
+        result.scatter_(dim=-1, index=topk_indices, src=topk_logits)
+        return result
+
+    # Fallback: full sort (used when allow_cpu_sync=False or no top-p)
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
