@@ -320,6 +320,11 @@ def apply_top_k_top_p(
     return apply_top_k_top_p_pytorch(logits, k, p)
 
 
+# Maximum candidates for top-p sampling: avoids O(V log V) full-vocab sort.
+# 1024 covers >99.9% probability mass for typical LLM outputs.
+_TOP_P_TOPK_SIZE = 1024
+
+
 def apply_top_k_top_p_pytorch(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -328,8 +333,9 @@ def apply_top_k_top_p_pytorch(
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
-    If a top-p is used, this function will sort the logits tensor,
-    which can be slow for large batches.
+    On CPU (allow_cpu_sync=True), uses topk instead of full-vocab sort for
+    large vocabularies. Top-p is applied directly in descending order
+    (no flip needed), saving an extra tensor operation.
 
     The logits tensor may be updated in-place.
     """
@@ -340,6 +346,44 @@ def apply_top_k_top_p_pytorch(
         if allow_cpu_sync:
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
+
+    vocab_size = logits.shape[1]
+
+    if p is not None and allow_cpu_sync:
+        # Fast path: topk returns descending order (largest first).
+        # Apply top-p in descending order: cumsum from the largest logit.
+        # Mask out tokens once cumsum of softmax probs exceeds p threshold.
+        topk_size = min(_TOP_P_TOPK_SIZE, vocab_size)
+        # logits_topk: [batch, topk_size] in descending order
+        logits_topk, logits_topk_idx = logits.topk(topk_size, dim=-1, largest=True, sorted=True)
+
+        if k is not None:
+            # Apply top-k: mask out tokens beyond the k-th largest.
+            effective_k = k.to(torch.long).clamp(max=topk_size)
+            # k_threshold: the k-th largest value per row
+            k_threshold = logits_topk.gather(1, (effective_k - 1).unsqueeze(1))
+            logits_topk.masked_fill_(logits_topk < k_threshold, -float("inf"))
+
+        # Apply top-p in descending order.
+        # probs_desc: softmax in descending order (largest prob first)
+        probs_desc = logits_topk.softmax(dim=-1)
+        # cumsum from largest to smallest; entries where cumsum-prob > p are
+        # already covered by the top tokens up to that point.
+        probs_cumsum = torch.cumsum(probs_desc, dim=-1, out=probs_desc)
+        # Shift cumsum right by 1: token i is included if cumsum(i-1) < p.
+        # After shift: probs_cumsum[:, 0] = 0, probs_cumsum[:, 1:] = cumsum[:, :-1]
+        shifted = probs_cumsum.roll(1, dims=-1)
+        shifted[:, 0] = 0.0
+        # Tokens where shifted cumsum >= p are excluded (too far in the tail).
+        top_p_mask = shifted >= p.unsqueeze(dim=1)
+        # Always keep the top-1 token.
+        top_p_mask[:, 0] = False
+        logits_topk.masked_fill_(top_p_mask, -float("inf"))
+
+        # Scatter back: tokens not in topk stay at -inf.
+        result = logits.new_full(logits.shape, -float("inf"))
+        result.scatter_(dim=-1, index=logits_topk_idx, src=logits_topk)
+        return result
 
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 

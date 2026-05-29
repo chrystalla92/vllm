@@ -5,6 +5,16 @@
 import torch
 import torch.nn.functional as F
 
+# Cache for identity matrices to avoid repeated torch.eye allocations.
+_CHUNK_EYE_CACHE: dict[tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
+
+
+def _get_chunk_eye(size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    key = (size, dtype, device)
+    if key not in _CHUNK_EYE_CACHE:
+        _CHUNK_EYE_CACHE[key] = torch.eye(size, dtype=dtype, device=device)
+    return _CHUNK_EYE_CACHE[key]
+
 
 def l2norm(
     x: torch.Tensor,
@@ -55,12 +65,13 @@ def recurrent_gated_delta_rule(
     )
     last_recurrent_state = initial_state.to(value)
 
-    for token_idx in range(sequence_length):
-        q_t = query[:, :, token_idx]
-        k_t = key[:, :, token_idx]
-        v_t = value[:, :, token_idx]
-        g_t = g[:, :, token_idx].exp().unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, :, token_idx].unsqueeze(-1)
+    if sequence_length == 1:
+        # Decode fast path: single-token step, no loop needed.
+        q_t = query[:, :, 0]
+        k_t = key[:, :, 0]
+        v_t = value[:, :, 0]
+        g_t = g[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, 0].unsqueeze(-1)
 
         last_recurrent_state = last_recurrent_state * g_t
         kv_mem = (last_recurrent_state * k_t.unsqueeze(-2)).sum(dim=-1)
@@ -68,9 +79,26 @@ def recurrent_gated_delta_rule(
         last_recurrent_state = last_recurrent_state + delta.unsqueeze(
             -1
         ) * k_t.unsqueeze(-2)
-        core_attn_out[:, :, token_idx] = (last_recurrent_state * q_t.unsqueeze(-2)).sum(
+        core_attn_out[:, :, 0] = (last_recurrent_state * q_t.unsqueeze(-2)).sum(
             dim=-1
         )
+    else:
+        for token_idx in range(sequence_length):
+            q_t = query[:, :, token_idx]
+            k_t = key[:, :, token_idx]
+            v_t = value[:, :, token_idx]
+            g_t = g[:, :, token_idx].exp().unsqueeze(-1).unsqueeze(-1)
+            beta_t = beta[:, :, token_idx].unsqueeze(-1)
+
+            last_recurrent_state = last_recurrent_state * g_t
+            kv_mem = (last_recurrent_state * k_t.unsqueeze(-2)).sum(dim=-1)
+            delta = (v_t - kv_mem) * beta_t
+            last_recurrent_state = last_recurrent_state + delta.unsqueeze(
+                -1
+            ) * k_t.unsqueeze(-2)
+            core_attn_out[:, :, token_idx] = (last_recurrent_state * q_t.unsqueeze(-2)).sum(
+                dim=-1
+            )
 
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
@@ -113,7 +141,7 @@ def chunk_gated_delta_rule(
         )
         for seq_idx in range(len(cu_seqlens) - 1)
     ]
-    chunk_eye = torch.eye(chunk_size, dtype=torch.float32)
+    chunk_eye = _get_chunk_eye(chunk_size, torch.float32, q.device)
     num_sequences = len(sequence_bounds)
     num_value_heads = v.shape[2]
     value_head_dim = v.shape[3]
