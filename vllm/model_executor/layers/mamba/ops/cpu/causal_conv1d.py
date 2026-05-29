@@ -70,10 +70,19 @@ def causal_conv1d_update_torch(
 ) -> torch.Tensor:
     assert activation in {None, "silu", "swish"}
 
-    _, dim, seq_len = x.shape
+    batch, dim, seq_len = x.shape
     state_len = conv_state.shape[-1]
 
-    x_new = torch.cat([conv_state, x], dim=-1).to(weight.dtype)
+    # Build the padded input by shifting the conv state and appending x.
+    # Uses two slice-copies instead of torch.cat to avoid allocating an
+    # extra [B, dim, state_len + seq_len] intermediate buffer.
+    x_new = torch.empty(
+        batch, dim, state_len + seq_len, dtype=weight.dtype, device=x.device
+    )
+    x_new[:, :, :state_len] = conv_state
+    x_new[:, :, state_len:] = x.to(weight.dtype)
+
+    # Update conv_state in-place from the tail of the new input.
     conv_state.copy_(x_new[:, :, -state_len:])
 
     out = F.conv1d(
