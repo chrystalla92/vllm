@@ -340,6 +340,10 @@ def apply_top_k_top_p_pytorch(
         if allow_cpu_sync:
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
+    elif k is not None and allow_cpu_sync:
+        bounded_logits = apply_top_k_top_p_bounded(logits, k, p)
+        if bounded_logits is not None:
+            return bounded_logits
 
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
@@ -362,6 +366,48 @@ def apply_top_k_top_p_pytorch(
 
     # Re-sort the probabilities.
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+
+def apply_top_k_top_p_bounded(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+) -> torch.Tensor | None:
+    """Apply top-k and top-p by sorting only a bounded candidate set on CPU.
+
+    This fast path is intentionally limited to rows with finite, reasonably
+    small top-k values.  It avoids the full-vocab sort used by top-p while
+    preserving the same mask semantics for the selected top-k candidates.
+    Returns ``None`` when the existing full-sort implementation should handle
+    the batch instead.
+    """
+    vocab_size = logits.shape[1]
+    no_top_k_mask = k == vocab_size
+    if no_top_k_mask.any().item():
+        return None
+
+    max_top_k = int(k.max().item())
+    if max_top_k <= 0 or max_top_k > 512:
+        return None
+
+    topk = logits.topk(max_top_k, dim=1)
+    topk_values = topk.values
+    topk_indices = topk.indices
+
+    row_positions = torch.arange(max_top_k, device=logits.device).unsqueeze(0)
+    row_k = k.to(torch.long).unsqueeze(1)
+    topk_values.masked_fill_(row_positions >= row_k, -float("inf"))
+
+    topk_sort, topk_order = topk_values.sort(dim=-1, descending=False)
+    probs_sort = topk_sort.softmax(dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+    top_p_mask[:, -1] = False
+    topk_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    topk_values.scatter_(dim=-1, index=topk_order, src=topk_sort)
+    logits.fill_(-float("inf"))
+    return logits.scatter_(dim=-1, index=topk_indices, src=topk_values)
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
