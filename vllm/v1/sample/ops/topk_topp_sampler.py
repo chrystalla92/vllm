@@ -168,6 +168,14 @@ class TopKTopPSampler(nn.Module):
 
         The logits tensor may be updated in-place.
         """
+        if (
+            self.logprobs_mode not in ("processed_logits", "processed_logprobs")
+            and len(generators) != logits.shape[0]
+        ):
+            direct_sampled = cpu_direct_topk_topp_sample_eager(logits, k, p)
+            if direct_sampled is not None:
+                return direct_sampled, None
+
         logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
@@ -362,6 +370,51 @@ def apply_top_k_top_p_pytorch(
 
     # Re-sort the probabilities.
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+
+def cpu_direct_topk_topp_sample_eager(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Eager compact top-k/top-p sampler for CPU decode."""
+    if k is None:
+        return None
+    if logits.ndim != 2 or logits.shape[0] == 0:
+        return None
+
+    vocab_size = logits.shape[1]
+    if bool((k == vocab_size).any()):
+        return None
+
+    max_top_k = int(k.max().item())
+    if max_top_k <= 0 or max_top_k > 1024:
+        return None
+
+    candidate_logits, candidate_indices = logits.topk(max_top_k, dim=1)
+    if max_top_k != int(k.min().item()):
+        candidate_positions = torch.arange(max_top_k, device=logits.device)
+        candidate_logits.masked_fill_(
+            candidate_positions >= k.to(torch.long).unsqueeze(1), -float("inf")
+        )
+
+    if p is not None:
+        sorted_logits, sorted_order = candidate_logits.sort(dim=-1, descending=False)
+        sorted_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32)
+        probs_sum = torch.cumsum(sorted_probs, dim=-1, out=sorted_probs)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        top_p_mask[:, -1] = False
+        sorted_logits.masked_fill_(top_p_mask, -float("inf"))
+        candidate_logits = torch.empty_like(candidate_logits).scatter_(
+            dim=-1, index=sorted_order, src=sorted_logits
+        )
+
+    probs = candidate_logits.softmax(dim=-1, dtype=torch.float32)
+    q = torch.empty_like(probs)
+    q.exponential_()
+    sampled_candidates = probs.div_(q).argmax(dim=-1).view(-1)
+    return candidate_indices.gather(1, sampled_candidates.unsqueeze(1)).view(-1)
+
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
