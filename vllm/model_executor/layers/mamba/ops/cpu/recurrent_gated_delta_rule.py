@@ -113,6 +113,7 @@ def chunk_gated_delta_rule(
         )
         for seq_idx in range(len(cu_seqlens) - 1)
     ]
+    # Pre-allocate chunk identity matrix once; reused across all chunks/seqs.
     chunk_eye = torch.eye(chunk_size, dtype=torch.float32)
     num_sequences = len(sequence_bounds)
     num_value_heads = v.shape[2]
@@ -174,24 +175,33 @@ def chunk_gated_delta_rule(
 
             cum_g = g_chunk.cumsum(dim=-1)
             exp_cum_g = cum_g.exp()
-            decay = (cum_g.unsqueeze(-1) - cum_g.unsqueeze(-2)).exp()
 
-            interaction = (k_chunk * beta_chunk.unsqueeze(-1)) @ k_chunk.transpose(
-                -1, -2
-            )
-            interaction = torch.tril(interaction * decay, diagonal=-1)
-            system = interaction + chunk_eye[:chunk_len, :chunk_len]
+            # Compute decay matrix as outer ratio of exp_cum_g to avoid a
+            # redundant exp() over the full [L, L] subtraction tensor.
+            # decay[i, j] = exp(cum_g[i] - cum_g[j]) = exp_cum_g[i] / exp_cum_g[j]
+            decay = exp_cum_g.unsqueeze(-1) / exp_cum_g.unsqueeze(-2)
 
-            solved_values = torch.linalg.solve_triangular(
-                system,
-                v_chunk * beta_chunk.unsqueeze(-1),
-                upper=False,
-            )
-            solved_keys = torch.linalg.solve_triangular(
-                system,
-                (k_chunk * beta_chunk.unsqueeze(-1)) * exp_cum_g.unsqueeze(-1),
-                upper=False,
-            )
+            # Pre-compute k*beta once; reused for both interaction and solved_keys.
+            k_beta = k_chunk * beta_chunk.unsqueeze(-1)  # [B, H, L, D_K]
+
+            # Build lower-triangular system matrix in-place to avoid extra alloc.
+            # interaction = tril(k_beta @ k^T * decay, diag=-1) + I
+            interaction = k_beta @ k_chunk.transpose(-1, -2)  # [B, H, L, L]
+            interaction.mul_(decay)
+            interaction.tril_(diagonal=-1)
+            # Add identity diagonal in-place (avoids allocating chunk_eye slice)
+            system = interaction
+            c_eye = chunk_eye[:chunk_len, :chunk_len]
+            system = system + c_eye  # shapes match; c_eye is pre-allocated
+
+            # RHS for value solve: beta-scaled values
+            rhs_v = v_chunk * beta_chunk.unsqueeze(-1)  # [B, H, L, D_V]
+
+            solved_values = torch.linalg.solve_triangular(system, rhs_v, upper=False)
+
+            # RHS for key solve: k_beta scaled by cumulative decay
+            rhs_k = k_beta * exp_cum_g.unsqueeze(-1)
+            solved_keys = torch.linalg.solve_triangular(system, rhs_k, upper=False)
 
             incoming_memory = torch.einsum("bhvk,bhck->bhcv", seq_state, solved_keys)
             transformed_values = solved_values - incoming_memory
