@@ -14,7 +14,6 @@ from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.cpu.recurrent_gated_delta_rule import (
     chunk_gated_delta_rule,
     gdn_gating,
-    recurrent_gated_delta_rule,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -102,31 +101,28 @@ def cpu_gdn_attention_core(
         key = key.transpose(0, 1).contiguous()
         value = value.transpose(0, 1).contiguous()
 
-        g, beta_output = gdn_gating(
-            A_log=layer.A_log,
-            a=decode_a,
-            b=decode_b,
-            dt_bias=layer.dt_bias,
-        )
-        if g.ndim == 2:
-            g = g.unsqueeze(1)
-            beta_output = beta_output.unsqueeze(1)
+        if query.shape[2] != value.shape[2]:
+            repeat_factor = value.shape[2] // query.shape[2]
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
 
-        initial_state = ssm_state[decode_state_indices].contiguous()
-        attn_out, last_recurrent_state = recurrent_gated_delta_rule(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta_output,
-            initial_state=initial_state,
-            scale=None,
-            use_qk_l2norm_in_kernel=True,
+        query = query.squeeze(1).float()
+        key = key.squeeze(1).float()
+        value = value.squeeze(1).float()
+
+        torch.ops._C.gdn_recurrent_decode_cpu(
+            query,
+            key,
+            value,
+            decode_a,
+            decode_b,
+            layer.A_log,
+            layer.dt_bias,
+            ssm_state,
+            decode_state_indices,
+            core_attn_out[:num_decode_tokens],
+            layer.head_k_dim**-0.5,
         )
-        ssm_state[decode_state_indices] = last_recurrent_state.to(
-            ssm_state.dtype
-        ).contiguous()
-        core_attn_out[:num_decode_tokens] = attn_out.squeeze(1)
 
     # all prefill requests: (varlen) currently naively loops over sequences
     if num_prefills > 0:
