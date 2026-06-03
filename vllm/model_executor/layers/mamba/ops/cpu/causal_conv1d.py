@@ -61,6 +61,35 @@ def causal_conv1d_torch(
 
 
 # for decode
+def causal_conv1d_update_single_token_torch(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = None,
+) -> torch.Tensor:
+    assert activation in {None, "silu", "swish"}
+
+    x_2d = x.squeeze(-1)
+    state_len = conv_state.shape[-1]
+    conv_input = torch.empty(
+        conv_state.shape[0],
+        conv_state.shape[1],
+        state_len + 1,
+        dtype=weight.dtype,
+        device=x.device,
+    )
+    conv_input[:, :, :state_len] = conv_state.to(weight.dtype)
+    conv_input[:, :, state_len] = x_2d.to(weight.dtype)
+    out = (conv_input * weight.unsqueeze(0)).sum(dim=-1)
+    if bias is not None:
+        out = out + bias
+    conv_state.copy_(conv_input[:, :, 1:].to(conv_state.dtype))
+    if activation in ("silu", "swish"):
+        out = F.silu(out)
+    return out.unsqueeze(-1).to(x.dtype)
+
+
 def causal_conv1d_update_torch(
     x: torch.Tensor,
     conv_state: torch.Tensor,
