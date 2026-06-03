@@ -341,6 +341,9 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
+    if allow_cpu_sync and p is not None:
+        return apply_top_p_topk_candidates(logits, k, p)
+
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
@@ -364,7 +367,66 @@ def apply_top_k_top_p_pytorch(
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
 
 
-def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+def apply_top_p_topk_candidates(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor
+) -> torch.Tensor:
+    """Apply top-p/top-k on CPU using a bounded topk candidate set."""
+    vocab_size = logits.shape[1]
+    if k is None:
+        max_candidates = min(vocab_size, 4096)
+        candidate_k = torch.full(
+            (logits.shape[0],), max_candidates, dtype=torch.long, device=logits.device
+        )
+    else:
+        candidate_k = k.to(torch.long).clamp_(min=1, max=vocab_size)
+        max_candidates = int(candidate_k.max().item())
+        if max_candidates == vocab_size:
+            logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+            top_k_mask = logits_sort.size(1) - candidate_k
+            top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+            top_k_mask = logits_sort < top_k_mask
+            logits_sort.masked_fill_(top_k_mask, -float("inf"))
+            probs_sort = logits_sort.softmax(dim=-1)
+            probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+            top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+            top_p_mask[:, -1] = False
+            logits_sort.masked_fill_(top_p_mask, -float("inf"))
+            return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+    candidate_vals, candidate_idx = logits.topk(max_candidates, dim=-1, largest=True)
+    candidate_vals, order = candidate_vals.sort(dim=-1, descending=True)
+    candidate_idx = candidate_idx.gather(1, order)
+
+    if k is not None:
+        arange = torch.arange(max_candidates, device=logits.device).unsqueeze(0)
+        candidate_vals.masked_fill_(arange >= candidate_k.unsqueeze(1), -float("inf"))
+
+    if k is None:
+        prefix_probs = logits.softmax(dim=-1, dtype=torch.float32).gather(1, candidate_idx)
+        if max_candidates < vocab_size and bool(
+            (prefix_probs.sum(dim=-1) < p).any().item()
+        ):
+            logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+            probs_sort = logits_sort.softmax(dim=-1)
+            probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+            top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+            top_p_mask[:, -1] = False
+            logits_sort.masked_fill_(top_p_mask, -float("inf"))
+            return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+        candidate_cumsum = torch.cumsum(prefix_probs, dim=-1, out=prefix_probs)
+    else:
+        candidate_probs = candidate_vals.softmax(dim=-1, dtype=torch.float32)
+        candidate_cumsum = torch.cumsum(candidate_probs, dim=-1, out=candidate_probs)
+
+    top_p_mask = candidate_cumsum >= p.unsqueeze(dim=1)
+    top_p_mask[:, 1:] = top_p_mask[:, :-1].clone()
+    top_p_mask[:, 0] = False
+    candidate_vals.masked_fill_(top_p_mask, -float("inf"))
+
+    logits.fill_(-float("inf"))
+    return logits.scatter_(dim=-1, index=candidate_idx, src=candidate_vals)
+
+
     """
     Apply top-k mask to the logits.
 
