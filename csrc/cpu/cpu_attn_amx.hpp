@@ -552,40 +552,62 @@ class AttentionImpl<ISA::AMX, scalar_t, head_dim, kv_cache_scalar_t> {
     scalar_t* __restrict__ kc = reinterpret_cast<scalar_t*>(key_cache);
     scalar_t* __restrict__ vc = reinterpret_cast<scalar_t*>(value_cache);
 
-#pragma omp parallel for collapse(2)
-    for (int64_t token_idx = 0; token_idx < token_num; ++token_idx) {
-      for (int64_t head_idx = 0; head_idx < head_num; ++head_idx) {
-        const int64_t pos = slot_mapping[token_idx];
-        if (pos < 0) {
-          // skip
-          continue;
-        }
+    // Key layout constants (all compile-time)
+    constexpr int64_t k_token_num_per_group = amx_tile_row_size / 4;
+    static_assert(head_dim % (4 / sizeof(scalar_t)) == 0);
+    constexpr int64_t quadword_num = head_dim / (4 / sizeof(scalar_t));
+    constexpr int64_t quadword_num_per_group =
+        k_token_num_per_group * quadword_num;
+    // Value layout constants (all compile-time except v_group_size)
+    constexpr int64_t v_token_num_per_sub_group = 4 / sizeof(scalar_t);
+    constexpr int64_t head_elems_per_group = amx_b_tile_n_size;
+    static_assert(head_dim % head_elems_per_group == 0);
+    constexpr int64_t group_num = head_dim / head_elems_per_group;
+    // v_group_size depends on block_size (runtime param), but is constant per
+    // call — hoist it out of both loops to avoid recomputing head_num times.
+    const int64_t v_group_size = block_size * head_elems_per_group;
 
-        const int64_t block_idx = pos / block_size;
-        const int64_t block_offset = pos % block_size;
+    // Parallelise over tokens only: pos/block_idx/block_offset are identical
+    // for every head of a given token, so computing them inside a collapse(2)
+    // loop wastes head_num integer divisions per token (typically 32×).
+    // Hoisting them to the token level reduces that to one division per token.
+#pragma omp parallel for
+    for (int64_t token_idx = 0; token_idx < token_num; ++token_idx) {
+      const int64_t pos = slot_mapping[token_idx];
+      if (pos < 0) {
+        // skip padding token — bypass all head iterations with a single check
+        continue;
+      }
+
+      // These computations depend only on pos/block_size, not on head_idx.
+      // Compute once here instead of head_num times inside the collapsed loop.
+      const int64_t block_idx = pos / block_size;
+      const int64_t block_offset = pos % block_size;
+      // Key: indices into the packed token-group layout
+      const int64_t key_group_idx = block_offset / k_token_num_per_group;
+      const int64_t key_group_offset = block_offset % k_token_num_per_group;
+      // Value: indices into the sub-group layout
+      const int64_t sub_group_idx = block_offset / v_token_num_per_sub_group;
+      const int64_t sub_group_offset =
+          block_offset % v_token_num_per_sub_group;
+
+      for (int64_t head_idx = 0; head_idx < head_num; ++head_idx) {
         {
           // Write Key
           // Head elements should be packed as quand-words and stored in token
           // groups with (quadword_stride/4) tokens
-          constexpr int64_t token_num_per_group = amx_tile_row_size / 4;
-          static_assert(head_dim % (4 / sizeof(scalar_t)) == 0);
-          constexpr int64_t quadword_num = head_dim / (4 / sizeof(scalar_t));
           const int32_t* key_start_quadword_ptr =
               reinterpret_cast<const int32_t*>(
                   key + token_idx * key_token_num_stride +
                   head_idx * key_head_num_stride);
-          const int64_t group_idx = block_offset / token_num_per_group;
-          const int64_t group_offset = block_offset % token_num_per_group;
-          constexpr int64_t quadword_num_per_group =
-              token_num_per_group * quadword_num;
           int32_t* key_cache_start_ptr =
               reinterpret_cast<int32_t*>(kc + block_idx * num_blocks_stride +
                                          head_idx * cache_head_num_stride) +
-              group_idx * quadword_num_per_group + group_offset;
+              key_group_idx * quadword_num_per_group + key_group_offset;
 
 #pragma GCC unroll 8
           for (int64_t i = 0, j = 0; j < quadword_num;
-               i += token_num_per_group, ++j) {
+               i += k_token_num_per_group, ++j) {
             key_cache_start_ptr[i] = key_start_quadword_ptr[j];
           }
         }
@@ -593,34 +615,23 @@ class AttentionImpl<ISA::AMX, scalar_t, head_dim, kv_cache_scalar_t> {
           // Write Value
           // Different from Key, block_size dimension is packed rather than
           // head_size dimension block_size dimension is packed as quand-words;
-          constexpr int64_t token_num_per_sub_group = 4 / sizeof(scalar_t);
-          const int64_t token_num_per_group = block_size;
-          constexpr int64_t head_elems_per_group = amx_b_tile_n_size;
-          const int64_t group_size = token_num_per_group * head_elems_per_group;
-          // For now suppose head_dim is divisible by amx_b_tile_n_size
-          static_assert(head_dim % head_elems_per_group == 0);
-          constexpr int64_t group_num = head_dim / head_elems_per_group;
-          const int64_t sub_group_idx = block_offset / token_num_per_sub_group;
-          const int64_t sub_group_offset =
-              block_offset % token_num_per_sub_group;
-
-          const scalar_t* value_start_ptr = value +
-                                            token_idx * value_token_num_stride +
-                                            head_idx * value_head_num_stride;
+          const scalar_t* value_start_ptr =
+              value + token_idx * value_token_num_stride +
+              head_idx * value_head_num_stride;
           scalar_t* value_cache_start_ptr =
               vc + block_idx * num_blocks_stride +
               head_idx * cache_head_num_stride +
-              sub_group_idx * token_num_per_sub_group * amx_b_tile_n_size +
+              sub_group_idx * v_token_num_per_sub_group * amx_b_tile_n_size +
               sub_group_offset;
 
           for (int64_t i = 0; i < group_num; ++i) {
 #pragma GCC unroll head_elems_per_group
             for (int64_t j = 0, k = 0; j < head_elems_per_group;
-                 ++j, k += token_num_per_sub_group) {
+                 ++j, k += v_token_num_per_sub_group) {
               value_cache_start_ptr[k] = value_start_ptr[j];
             }
             value_start_ptr += head_elems_per_group;
-            value_cache_start_ptr += group_size;
+            value_cache_start_ptr += v_group_size;
           }
         }
       }
