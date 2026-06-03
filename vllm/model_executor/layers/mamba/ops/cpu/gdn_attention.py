@@ -14,7 +14,7 @@ from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.cpu.recurrent_gated_delta_rule import (
     chunk_gated_delta_rule,
     gdn_gating,
-    recurrent_gated_delta_rule,
+    l2norm,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -85,14 +85,13 @@ def cpu_gdn_attention_core(
         decode_state_indices = state_indices_tensor[:num_decodes]
         decode_conv_state = conv_state[decode_state_indices].contiguous()
 
-        decode_mixed_qkv = causal_conv1d_update_torch(
-            # [B, dim] -> [B, dim, 1]
-            x=decode_mixed_qkv.unsqueeze(-1),
-            conv_state=decode_conv_state,
-            weight=conv_weights,
-            bias=layer.conv1d.bias,
-            activation=layer.activation,
-        ).squeeze(-1)
+        conv_input = torch.cat([decode_conv_state, decode_mixed_qkv.unsqueeze(-1)], dim=-1)
+        decode_conv_state.copy_(conv_input[:, :, 1:])
+        decode_mixed_qkv = (conv_input.to(conv_weights.dtype) * conv_weights).sum(dim=-1)
+        if layer.conv1d.bias is not None:
+            decode_mixed_qkv = decode_mixed_qkv + layer.conv1d.bias
+        if layer.activation in ("silu", "swish"):
+            decode_mixed_qkv = torch.nn.functional.silu(decode_mixed_qkv)
         conv_state[decode_state_indices] = decode_conv_state
 
         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
@@ -102,31 +101,33 @@ def cpu_gdn_attention_core(
         key = key.transpose(0, 1).contiguous()
         value = value.transpose(0, 1).contiguous()
 
+        if query.shape[2] != value.shape[2]:
+            repeat_factor = value.shape[2] // query.shape[2]
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
+
+        query = l2norm(query.squeeze(1), dim=-1, eps=1e-6).float().mul_(
+            layer.head_k_dim**-0.5
+        )
+        key = l2norm(key.squeeze(1), dim=-1, eps=1e-6).float()
+        value = value.squeeze(1).float()
+
         g, beta_output = gdn_gating(
             A_log=layer.A_log,
             a=decode_a,
             b=decode_b,
             dt_bias=layer.dt_bias,
         )
-        if g.ndim == 2:
-            g = g.unsqueeze(1)
-            beta_output = beta_output.unsqueeze(1)
 
-        initial_state = ssm_state[decode_state_indices].contiguous()
-        attn_out, last_recurrent_state = recurrent_gated_delta_rule(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta_output,
-            initial_state=initial_state,
-            scale=None,
-            use_qk_l2norm_in_kernel=True,
-        )
-        ssm_state[decode_state_indices] = last_recurrent_state.to(
-            ssm_state.dtype
-        ).contiguous()
-        core_attn_out[:num_decode_tokens] = attn_out.squeeze(1)
+        recurrent_state = ssm_state[decode_state_indices].to(value)
+        recurrent_state.mul_(g.exp().unsqueeze(-1).unsqueeze(-1))
+        kv_mem = (recurrent_state * key.unsqueeze(-2)).sum(dim=-1)
+        delta = (value - kv_mem) * beta_output.unsqueeze(-1).float()
+        recurrent_state.add_(delta.unsqueeze(-1) * key.unsqueeze(-2))
+        core_attn_out[:num_decode_tokens] = (
+            recurrent_state * query.unsqueeze(-2)
+        ).sum(dim=-1).to(core_attn_out.dtype)
+        ssm_state[decode_state_indices] = recurrent_state.to(ssm_state.dtype)
 
     # all prefill requests: (varlen) currently naively loops over sequences
     if num_prefills > 0:
