@@ -130,6 +130,21 @@ void cpu_attention_with_kv_cache(
     const std::optional<torch::Tensor>& s_aux, const double k_scale,
     const double v_scale, const std::string& kv_cache_dtype);
 
+void gdn_recurrent_decode_cpu(
+    const torch::Tensor& query, const torch::Tensor& key,
+    const torch::Tensor& value, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias, torch::Tensor& ssm_state,
+    const torch::Tensor& state_indices, torch::Tensor& out, double scale);
+
+void gdn_recurrent_prefill_cpu(
+    const torch::Tensor& query, const torch::Tensor& key,
+    const torch::Tensor& value, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias, torch::Tensor& ssm_state,
+    const torch::Tensor& state_indices, const torch::Tensor& cu_seqlens,
+    const torch::Tensor& has_initial_state, torch::Tensor& out, double scale);
+
 // Note: just for avoiding importing errors
 void placeholder_op() { TORCH_CHECK(false, "Unimplemented"); }
 
@@ -398,6 +413,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_vnni) -> Tensor");
   ops.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
 #endif
+
+  // GDN decode/prefill kernels
+  ops.def(
+      "gdn_recurrent_decode_cpu(Tensor query, Tensor key, Tensor value, "
+      "Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a7!) ssm_state, "
+      "Tensor state_indices, Tensor(a9!) out, float scale) -> ()");
+  ops.impl("gdn_recurrent_decode_cpu", torch::kCPU, &gdn_recurrent_decode_cpu);
+  ops.def(
+      "gdn_recurrent_prefill_cpu(Tensor query, Tensor key, Tensor value, "
+      "Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor(a7!) ssm_state, "
+      "Tensor state_indices, Tensor cu_seqlens, Tensor has_initial_state, "
+      "Tensor(a11!) out, float scale) -> ()");
+  ops.impl("gdn_recurrent_prefill_cpu", torch::kCPU, &gdn_recurrent_prefill_cpu);
 
   // CPU attention kernels
   ops.def(
