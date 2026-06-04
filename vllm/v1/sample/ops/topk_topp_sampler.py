@@ -166,9 +166,10 @@ class TopKTopPSampler(nn.Module):
         """
         PyTorch-native implementation of top-k and top-p sampling for CPU.
 
-        The logits tensor may be updated in-place.
+        Uses adaptive topk to avoid full vocab sort for top-p filtering.
         """
-        logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+        logits = apply_top_k_top_p_cpu_adaptive(logits, k, p,
+                                                allow_cpu_sync=True)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -362,6 +363,65 @@ def apply_top_k_top_p_pytorch(
 
     # Re-sort the probabilities.
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+
+def apply_top_k_top_p_cpu_adaptive(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    allow_cpu_sync: bool = False,
+) -> torch.Tensor:
+    """CPU-optimized top-k and top-p using topk instead of full sort.
+
+    For large vocabularies (e.g., 152k), topk(1024) is much faster than
+    full sort since it only partially orders the vocabulary.
+
+    The logits tensor may be updated in-place.
+    """
+    if p is None and k is None:
+        return logits
+
+    if p is None:
+        # top-k only path: avoid sort
+        if allow_cpu_sync:
+            return apply_top_k_only(logits, k)
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # type: ignore
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        top_k_mask = logits_sort < top_k_mask
+        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+        return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+    # top-p active: use adaptive topk instead of full sort
+    batch_size, vocab_size = logits.shape
+    k_adaptive = min(vocab_size, 1024)
+    if k is not None:
+        k_adaptive = max(k_adaptive, int(k.max().item()))
+    k_adaptive = min(k_adaptive, vocab_size)
+
+    # Descending topk: largest first
+    top_values, top_indices = logits.topk(k_adaptive, dim=-1,
+                                          sorted=True, largest=True)
+
+    if k is not None:
+        ranks = torch.arange(k_adaptive, device=logits.device,
+                             dtype=torch.long).unsqueeze(0)
+        top_values = top_values.masked_fill(
+            ranks >= k.unsqueeze(1).to(torch.long), -float("inf"))
+
+    # Cumulative probability from top; mask where we already have >= p mass
+    probs = top_values.softmax(dim=-1, dtype=torch.float32)
+    probs_cumsum = probs.cumsum(dim=-1)
+    shifted_cumsum = probs_cumsum - probs
+    top_p_threshold = p.unsqueeze(1).to(dtype=probs.dtype)
+    top_p_mask = shifted_cumsum >= top_p_threshold
+    top_p_mask[:, 0] = False  # always keep the top token
+    top_values = top_values.masked_fill(top_p_mask, -float("inf"))
+
+    # Scatter back to original positions
+    result = torch.full_like(logits, -float("inf"))
+    result.scatter_(1, top_indices, top_values)
+    return result
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
