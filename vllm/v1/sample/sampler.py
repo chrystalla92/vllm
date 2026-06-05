@@ -72,6 +72,11 @@ class Sampler(nn.Module):
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
+        if self._can_use_greedy_no_logprobs_fast_path(sampling_metadata):
+            return self._forward_greedy_no_logprobs_fast_path(
+                logits, sampling_metadata, predict_bonus_token
+            )
+
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
@@ -141,6 +146,33 @@ class Sampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    @staticmethod
+    def _can_use_greedy_no_logprobs_fast_path(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        return (
+            sampling_metadata.all_greedy
+            and sampling_metadata.max_num_logprobs is None
+            and not sampling_metadata.logprob_token_ids
+        )
+
+    def _forward_greedy_no_logprobs_fast_path(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool,
+    ) -> SamplerOutput:
+        if logits.dtype != torch.float32:
+            logits = logits.to(torch.float32)
+        logits = self.apply_logits_processors(
+            logits, sampling_metadata, predict_bonus_token
+        )
+        sampled = self.greedy_sample(logits).to(torch.int32)
+        return SamplerOutput(
+            sampled_token_ids=sampled.unsqueeze(-1),
+            logprobs_tensors=None,
+        )
 
     def gather_specific_token_logprobs(
         self,
