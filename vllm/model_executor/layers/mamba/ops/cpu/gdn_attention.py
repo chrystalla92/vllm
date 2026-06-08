@@ -168,17 +168,40 @@ def cpu_gdn_attention_core(
 
         initial_state = ssm_state[prefill_state_indices].contiguous()
         initial_state[~prefill_has_initial_state, ...] = 0
-        attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            scale=None,
-            initial_state=initial_state,
-            cu_seqlens=prefill_query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-        )
+        if (
+            query.dtype == torch.bfloat16
+            and key.dtype == torch.bfloat16
+            and value.dtype == torch.bfloat16
+            and initial_state.dtype == torch.float32
+            and prefill_query_start_loc.dtype is torch.int32
+            and query.shape[-1] % 32 == 0
+            and value.shape[-1] % 32 == 0
+        ):
+            attn_out, last_recurrent_state = torch.ops._C.chunk_gated_delta_rule_cpu(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                g.contiguous(),
+                beta.contiguous(),
+                initial_state.contiguous(),
+                True,
+                prefill_query_start_loc.contiguous(),
+                False,
+                True,
+                1e-6,
+            )
+        else:
+            attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                scale=None,
+                initial_state=initial_state,
+                cu_seqlens=prefill_query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
         ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
         core_attn_out[prefill_token_start:prefill_token_end] = attn_out.squeeze(0)
 

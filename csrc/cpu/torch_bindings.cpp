@@ -58,6 +58,13 @@ std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
 // SGL CPU kernels
 
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& g, const at::Tensor& beta,
+    const at::Tensor& initial_state, bool output_final_state,
+    const at::Tensor& cu_seqlens, bool head_first,
+    bool use_qk_l2norm_in_kernel, double eps);
+
 at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
                                 const std::optional<at::Tensor>& bias,
                                 bool is_vnni);
@@ -359,6 +366,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // sgl-kernels
 #if defined(__AVX512BF16__) && defined(__AVX512F__) && defined(__AVX512VNNI__)
+  ops.def(
+      "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, "
+      "Tensor g, Tensor beta, Tensor initial_state, bool output_final_state, "
+      "Tensor cu_seqlens, bool head_first, bool use_qk_l2norm_in_kernel, "
+      "float eps=1e-5) -> (Tensor, Tensor)");
+  ops.impl("chunk_gated_delta_rule_cpu", torch::kCPU,
+           &chunk_gated_delta_rule_cpu);
+
   ops.def(
       "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
       "bias, bool is_vnni) -> Tensor");
