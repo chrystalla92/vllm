@@ -7,16 +7,17 @@ set -uo pipefail
 # healthy, runs `vllm bench serve` against it, filters the raw results down
 # to numeric metrics, and tears everything down.
 
-MODEL="Qwen/Qwen3.6-35B-A3B"
+# Benchmark parameters (override via environment variables).
+MODEL="${MODEL:-Qwen/Qwen3.6-35B-A3B}"
+NUM_PROMPTS="${NUM_PROMPTS:-50}"
+RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-512}"
+RANDOM_OUTPUT_LEN="${RANDOM_OUTPUT_LEN:-512}"
 
 docker network create vllm-bench-net 2>/dev/null || true
 
 CONTAINER_ID=$(docker run -d --name vllm-server --network vllm-bench-net -p 8000:8000 --ipc=host --privileged \
   -e VLLM_CPU_KVCACHE_SPACE=40 \
   -e VLLM_CPU_OMP_THREADS_BIND=auto \
-  -e HF_HOME=/hf \
-  -e HF_TOKEN="$HF_TOKEN" \
-  -v /home/chrystalla/repos/optimisation-orchestrator/.local/models:/hf \
   vllm_artemis:cpu \
   --model "$MODEL" \
   --dtype bfloat16 \
@@ -75,10 +76,10 @@ docker run --rm --network vllm-bench-net \
   --endpoint /v1/completions \
   --base-url http://vllm-server:8000 \
   --model "$MODEL" \
-  --num-prompts 50 \
+  --num-prompts "$NUM_PROMPTS" \
   --dataset-name random \
-  --random-input-len 512 \
-  --random-output-len 512 \
+  --random-input-len "$RANDOM_INPUT_LEN" \
+  --random-output-len "$RANDOM_OUTPUT_LEN" \
   --max-concurrency 32 \
   --request-rate inf \
   --ignore-eos \
