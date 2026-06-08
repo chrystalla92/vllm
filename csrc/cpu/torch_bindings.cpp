@@ -58,6 +58,15 @@ std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
 // SGL CPU kernels
 
+at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x, const at::Tensor& conv_states,
+    const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+    bool silu_activation, const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices, int64_t pad_slot_id,
+    bool is_vnni);
+
 at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
                                 const std::optional<at::Tensor>& bias,
                                 bool is_vnni);
@@ -359,6 +368,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // sgl-kernels
 #if defined(__AVX512BF16__) && defined(__AVX512F__) && defined(__AVX512VNNI__)
+  ops.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
+  ops.impl("causal_conv1d_weight_pack", torch::kCPU,
+           &causal_conv1d_weight_pack);
+  ops.def(
+      "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, "
+      "Tensor? bias, bool silu_activation, Tensor? cache_seqlens, "
+      "Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
+  ops.impl("causal_conv1d_update_cpu", torch::kCPU,
+           &causal_conv1d_update_cpu);
+
   ops.def(
       "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
       "bias, bool is_vnni) -> Tensor");

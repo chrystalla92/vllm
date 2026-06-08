@@ -9,7 +9,6 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
     causal_conv1d_torch,
-    causal_conv1d_update_torch,
 )
 from vllm.model_executor.layers.mamba.ops.cpu.recurrent_gated_delta_rule import (
     chunk_gated_delta_rule,
@@ -73,9 +72,14 @@ def cpu_gdn_attention_core(
     num_prefills = attn_metadata_i.num_prefills
     num_prefill_tokens = attn_metadata_i.num_prefill_tokens
 
-    conv_weights = layer.conv1d.weight.view(
-        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
-    )
+    conv_weights = getattr(layer, "_cpu_gdn_conv1d_packed_weight", None)
+    if conv_weights is None:
+        conv_weights = torch.ops._C.causal_conv1d_weight_pack(
+            layer.conv1d.weight.view(
+                layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
+            ).contiguous()
+        )
+        layer._cpu_gdn_conv1d_packed_weight = conv_weights
 
     # all decode requests (batched)
     if num_decodes > 0:
@@ -83,17 +87,17 @@ def cpu_gdn_attention_core(
         decode_b = b[:num_decode_tokens]
         decode_a = a[:num_decode_tokens]
         decode_state_indices = state_indices_tensor[:num_decodes]
-        decode_conv_state = conv_state[decode_state_indices].contiguous()
-
-        decode_mixed_qkv = causal_conv1d_update_torch(
-            # [B, dim] -> [B, dim, 1]
-            x=decode_mixed_qkv.unsqueeze(-1),
-            conv_state=decode_conv_state,
-            weight=conv_weights,
-            bias=layer.conv1d.bias,
-            activation=layer.activation,
-        ).squeeze(-1)
-        conv_state[decode_state_indices] = decode_conv_state
+        decode_mixed_qkv = torch.ops._C.causal_conv1d_update_cpu(
+            decode_mixed_qkv.contiguous(),
+            conv_state,
+            conv_weights,
+            layer.conv1d.bias,
+            layer.activation in ("silu", "swish"),
+            None,
+            decode_state_indices.to(torch.int32).contiguous(),
+            -1,
+            True,
+        )
 
         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
 
