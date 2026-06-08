@@ -84,6 +84,19 @@ def gdn_gating(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        beta == 1.0
+        and threshold == 20.0
+        and a.is_cpu
+        and b.is_cpu
+        and A_log.is_cpu
+        and dt_bias.is_cpu
+        and hasattr(torch.ops._C, "fused_gdn_gating_cpu")
+    ):
+        return torch.ops._C.fused_gdn_gating_cpu(
+            A_log, a.contiguous(), b.contiguous(), dt_bias
+        )
+
     softplus_x = F.softplus(a.float() + dt_bias.float(), beta=beta, threshold=threshold)
     g = -torch.exp(A_log.float()) * softplus_x
     beta_output = torch.sigmoid(b.float()).to(dtype=b.dtype)

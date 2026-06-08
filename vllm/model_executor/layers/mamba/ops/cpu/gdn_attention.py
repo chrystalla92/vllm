@@ -7,10 +7,7 @@ import torch
 
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
-    causal_conv1d_torch,
-    causal_conv1d_update_torch,
-)
+from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import causal_conv1d_torch
 from vllm.model_executor.layers.mamba.ops.cpu.recurrent_gated_delta_rule import (
     chunk_gated_delta_rule,
     gdn_gating,
@@ -83,17 +80,30 @@ def cpu_gdn_attention_core(
         decode_b = b[:num_decode_tokens]
         decode_a = a[:num_decode_tokens]
         decode_state_indices = state_indices_tensor[:num_decodes]
-        decode_conv_state = conv_state[decode_state_indices].contiguous()
 
-        decode_mixed_qkv = causal_conv1d_update_torch(
-            # [B, dim] -> [B, dim, 1]
-            x=decode_mixed_qkv.unsqueeze(-1),
-            conv_state=decode_conv_state,
-            weight=conv_weights,
-            bias=layer.conv1d.bias,
-            activation=layer.activation,
-        ).squeeze(-1)
-        conv_state[decode_state_indices] = decode_conv_state
+        if hasattr(torch.ops._C, "causal_conv1d_update_cpu"):
+            decode_mixed_qkv = torch.ops._C.causal_conv1d_update_cpu(
+                decode_mixed_qkv.contiguous(),
+                conv_state,
+                conv_weights,
+                layer.conv1d.bias,
+                layer.activation in ("silu", "swish"),
+                None,
+                decode_state_indices.to(torch.int32),
+                -1,
+                False,
+            )
+        else:
+            decode_conv_state = conv_state[decode_state_indices].contiguous()
+            decode_mixed_qkv = causal_conv1d_update_torch(
+                # [B, dim] -> [B, dim, 1]
+                x=decode_mixed_qkv.unsqueeze(-1),
+                conv_state=decode_conv_state,
+                weight=conv_weights,
+                bias=layer.conv1d.bias,
+                activation=layer.activation,
+            ).squeeze(-1)
+            conv_state[decode_state_indices] = decode_conv_state
 
         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
 
