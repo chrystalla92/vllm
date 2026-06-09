@@ -257,6 +257,58 @@ def mla_decode_kvcache_cpu(
     torch.ops._C.mla_decode_kvcache(out, query, kv_cache, scale, block_tables, seq_lens)
 
 
+def causal_conv1d_update_cpu(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    silu_activation: bool,
+    cache_seqlens: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+    pad_slot_id: int,
+    is_vnni: bool,
+) -> torch.Tensor:
+    return torch.ops._C.causal_conv1d_update_cpu(
+        x,
+        conv_states,
+        weight,
+        bias,
+        silu_activation,
+        cache_seqlens,
+        conv_state_indices,
+        pad_slot_id,
+        is_vnni,
+    )
+
+
+def chunk_gated_delta_rule_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    head_first: bool,
+    use_qk_l2norm_in_kernel: bool,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.chunk_gated_delta_rule_cpu(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        head_first,
+        use_qk_l2norm_in_kernel,
+        eps,
+    )
+
+
 # merge attn states ops
 def merge_attn_states(
     output: torch.Tensor,
