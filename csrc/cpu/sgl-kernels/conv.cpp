@@ -7,6 +7,8 @@
 #include "gemm.h"
 #include "vec.h"
 
+#include <cmath>
+
 namespace {
 
 template <typename scalar_t>
@@ -446,6 +448,48 @@ void causal_conv1d_update_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+void causal_conv1d_update_reference_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ conv_states,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ conv_indices,
+    bool silu_activation,
+    int64_t batch,
+    int64_t dim,
+    int64_t width) {
+  const bool has_bias = bias != nullptr;
+  const bool has_conv_indices = conv_indices != nullptr;
+
+  at::parallel_for(0, batch * dim, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t bs = i / dim;
+      int64_t d = i - bs * dim;
+      int64_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+      scalar_t* state = conv_states + conv_state_index * (width - 1) * dim + d;
+      const scalar_t* w = weight + d * width;
+
+      float acc = has_bias ? static_cast<float>(bias[d]) : 0.0f;
+      for (int64_t kw = 0; kw < width - 1; ++kw) {
+        acc += static_cast<float>(state[kw * dim]) * static_cast<float>(w[kw]);
+      }
+      scalar_t x = input[bs * dim + d];
+      acc += static_cast<float>(x) * static_cast<float>(w[width - 1]);
+      if (silu_activation) {
+        acc = acc / (1.0f + std::exp(-acc));
+      }
+      out[bs * dim + d] = static_cast<scalar_t>(acc);
+
+      for (int64_t kw = 1; kw < width - 1; ++kw) {
+        state[(kw - 1) * dim] = state[kw * dim];
+      }
+      state[(width - 2) * dim] = x;
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // from [dim, width] or [N, K]
@@ -662,7 +706,6 @@ at::Tensor causal_conv1d_update_cpu(
     bool is_vnni) {
   CHECK_CONTIGUOUS(x);
   CHECK_CONTIGUOUS(weight);
-  auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
 
   // TODO: add multi-token prediction support
   TORCH_CHECK(x.dim() == 2, "causal_conv1d_update_cpu: expect x to be 2D tensor.");
@@ -691,18 +734,17 @@ at::Tensor causal_conv1d_update_cpu(
   }
 
   at::Tensor out = at::empty_like(x);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
-    causal_conv1d_update_kernel_impl<scalar_t>(
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_reference_kernel_impl", [&] {
+    causal_conv1d_update_reference_kernel_impl<scalar_t>(
         out.data_ptr<scalar_t>(),
         x.data_ptr<scalar_t>(),
         conv_states.data_ptr<scalar_t>(),
-        packed_w.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
         conditional_data_ptr<scalar_t>(bias),
         conditional_data_ptr<int32_t>(conv_state_indices),
         silu_activation,
         batch,
         dim,
-        seqlen,
         width);
   });
   return out;

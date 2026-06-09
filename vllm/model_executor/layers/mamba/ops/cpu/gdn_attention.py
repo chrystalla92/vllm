@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import torch
 
+from vllm import _custom_ops as ops
+
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
@@ -24,6 +26,69 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 _CPU_GDN_ATTENTION_OPS_REGISTERED = False
+
+
+def _can_use_cpu_gdn_decode_conv_update(
+    layer,
+    mixed_qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> bool:
+    return (
+        layer.activation in ("silu", "swish")
+        and layer.conv_kernel_size == 4
+        and mixed_qkv.dim() == 2
+        and mixed_qkv.is_contiguous()
+        and conv_state.dim() == 3
+        and conv_state.is_contiguous()
+        and conv_state.dtype == mixed_qkv.dtype
+        and conv_weights.dtype == mixed_qkv.dtype
+        and conv_state.shape[1] == mixed_qkv.shape[1]
+        and conv_state.shape[2] == layer.conv_kernel_size - 1
+        and conv_weights.shape == (mixed_qkv.shape[1], layer.conv_kernel_size)
+        and state_indices.dtype == torch.int32
+        and not is_conv_state_dim_first()
+    )
+
+
+def _can_use_cpu_gdn_prefill_chunk_kernel(
+    ssm_state: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> bool:
+    return (
+        ssm_state.dtype == torch.float32
+        and query.dim() == 4
+        and key.shape == query.shape
+        and value.dim() == 4
+        and g.dim() == 3
+        and beta.dim() == 3
+        and initial_state.dim() == 4
+        and cu_seqlens.dim() == 1
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and beta.dtype == torch.bfloat16
+        and g.dtype == torch.float32
+        and initial_state.dtype == torch.float32
+        and cu_seqlens.dtype == torch.int32
+        and query.shape[0] == 1
+        and g.shape[:2] == query.shape[:2]
+        and beta.shape == g.shape
+        and initial_state.shape[0] + 1 == cu_seqlens.shape[0]
+        and value.shape[2] == g.shape[2]
+        and initial_state.shape[1] == value.shape[2]
+        and initial_state.shape[2] == query.shape[3]
+        and initial_state.shape[3] == value.shape[3]
+        and query.shape[3] % 32 == 0
+        and value.shape[3] % 32 == 0
+    )
 
 
 def cpu_gdn_attention_core(
@@ -83,17 +148,36 @@ def cpu_gdn_attention_core(
         decode_b = b[:num_decode_tokens]
         decode_a = a[:num_decode_tokens]
         decode_state_indices = state_indices_tensor[:num_decodes]
-        decode_conv_state = conv_state[decode_state_indices].contiguous()
 
-        decode_mixed_qkv = causal_conv1d_update_torch(
-            # [B, dim] -> [B, dim, 1]
-            x=decode_mixed_qkv.unsqueeze(-1),
-            conv_state=decode_conv_state,
-            weight=conv_weights,
-            bias=layer.conv1d.bias,
-            activation=layer.activation,
-        ).squeeze(-1)
-        conv_state[decode_state_indices] = decode_conv_state
+        if _can_use_cpu_gdn_decode_conv_update(
+            layer,
+            decode_mixed_qkv,
+            conv_state,
+            conv_weights,
+            decode_state_indices,
+        ):
+            decode_mixed_qkv = ops.causal_conv1d_update_cpu(
+                decode_mixed_qkv,
+                conv_state,
+                conv_weights.contiguous(),
+                layer.conv1d.bias,
+                True,
+                None,
+                decode_state_indices,
+                -1,
+                False,
+            )
+        else:
+            decode_conv_state = conv_state[decode_state_indices].contiguous()
+            decode_mixed_qkv = causal_conv1d_update_torch(
+                # [B, dim] -> [B, dim, 1]
+                x=decode_mixed_qkv.unsqueeze(-1),
+                conv_state=decode_conv_state,
+                weight=conv_weights,
+                bias=layer.conv1d.bias,
+                activation=layer.activation,
+            ).squeeze(-1)
+            conv_state[decode_state_indices] = decode_conv_state
 
         query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
 
@@ -168,17 +252,43 @@ def cpu_gdn_attention_core(
 
         initial_state = ssm_state[prefill_state_indices].contiguous()
         initial_state[~prefill_has_initial_state, ...] = 0
-        attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            scale=None,
-            initial_state=initial_state,
-            cu_seqlens=prefill_query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-        )
+        sgl_initial_state = initial_state.transpose(-1, -2).contiguous()
+        if _can_use_cpu_gdn_prefill_chunk_kernel(
+            ssm_state,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            sgl_initial_state,
+            prefill_query_start_loc,
+        ):
+            attn_out, sgl_last_recurrent_state = ops.chunk_gated_delta_rule_cpu(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                sgl_initial_state,
+                True,
+                prefill_query_start_loc,
+                False,
+                True,
+                1e-5,
+            )
+            last_recurrent_state = sgl_last_recurrent_state.transpose(-1, -2)
+        else:
+            attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                scale=None,
+                initial_state=initial_state,
+                cu_seqlens=prefill_query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
         ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
         core_attn_out[prefill_token_start:prefill_token_end] = attn_out.squeeze(0)
 
