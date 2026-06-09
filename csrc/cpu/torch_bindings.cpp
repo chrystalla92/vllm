@@ -78,6 +78,22 @@ at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2,
                                      const std::optional<at::Tensor>& bias,
                                      at::ScalarType out_dtype, bool is_vnni);
 
+at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x, const at::Tensor& conv_states,
+    const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+    bool silu_activation, const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices, int64_t pad_slot_id,
+    bool is_vnni);
+
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& g, const at::Tensor& beta,
+    const at::Tensor& initial_state, bool output_final_state,
+    const at::Tensor& cu_seqlens, bool head_first,
+    bool use_qk_l2norm_in_kernel, double eps = 1e-5);
+
 // Adapted from sglang: FP8 W8A16 kernel
 at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
                              at::Tensor& scales2,
@@ -377,6 +393,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
   ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
            &int8_scaled_mm_with_quant);
+
+  ops.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
+  ops.impl("causal_conv1d_weight_pack", torch::kCPU,
+           &causal_conv1d_weight_pack);
+  ops.def(
+      "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, "
+      "Tensor? bias, bool silu_activation, Tensor? cache_seqlens, "
+      "Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
+  ops.impl("causal_conv1d_update_cpu", torch::kCPU,
+           &causal_conv1d_update_cpu);
+  ops.def(
+      "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, "
+      "Tensor g, Tensor beta, Tensor initial_state, bool output_final_state, "
+      "Tensor cu_seqlens, bool head_first, bool use_qk_l2norm_in_kernel, "
+      "float eps=1e-5) -> (Tensor, Tensor)");
+  ops.impl("chunk_gated_delta_rule_cpu", torch::kCPU,
+           &chunk_gated_delta_rule_cpu);
 
   // Adapted from sglang: INT4 W4A8 kernels
   ops.def(
