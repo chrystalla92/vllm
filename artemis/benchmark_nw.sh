@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Artemis benchmark against the COMPANY production trace (nw-benchmark).
+#
+# Why this exists: artemis/benchmark.sh measures a synthetic 3000/300 conc-8
+# shape which is DECODE-dominated. The production trace is PREFILL-dominated
+# (518 input tok/s vs 40 output tok/s at saturation, a 13:1 ratio), so
+# optimising against the synthetic shape optimises the wrong thing.
+#
+# Design decisions, each measured rather than assumed:
+#  - --rate-multiplier 3: at rate 1.0 the CPU server keeps up and drains its
+#    queue, so Output tok/s is pinned by the trace and reads 0.00% for ANY
+#    engine change. 3x makes the server the bottleneck.
+#  - --no-enable-prefix-caching: cache hit ratio swings 0.905-1.486 across
+#    runs of the same trace+seed (endogenous: engine speed changes request
+#    interleaving changes prefix residency). That variance would drown the
+#    signal. Deterministic proxy here; validate winners against the real
+#    production config separately.
+#  - Inductor ON (no --enforce-eager).
+#  - The torch.compile cache is mounted persistently so Inductor work is
+#    reused across candidates; C++ kernel edits do not invalidate the graph,
+#    so this saves the compile on every candidate after the first.
+#  - nw-benchmark needs GLIBC 2.38; this host has 2.36, so it runs inside
+#    ubuntu:24.04 with --network host.
+
+MODEL="${MODEL:-Qwen/Qwen3.6-35B-A3B}"
+NW_DIR="${NW_DIR:-/home/chrystalla/nw-benchmark-v1.0.0}"
+TRACE="${TRACE:-traces/Qwen3.6-35B-A3B_prod_2026-06-12_2h_filtered_24k}"
+HF_CACHE_DIR="${HF_CACHE_DIR:-/home/chrystalla/optimisation-orchestrator/.local/models}"
+COMPILE_CACHE="${COMPILE_CACHE:-/home/chrystalla/.cache/vllm-compile}"
+DURATION="${DURATION:-600}"
+RATE="${RATE:-3}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-2400}"
+
+mkdir -p "$COMPILE_CACHE"
+cleanup() { docker rm -f nw-artemis-server 2>/dev/null >/dev/null; }
+trap cleanup EXIT
+cleanup
+
+docker run -d --name nw-artemis-server --network host --ipc=host --privileged --shm-size 16g \
+  -e HF_HOME=/hf -e VLLM_CPU_KVCACHE_SPACE=20 -e VLLM_CPU_OMP_THREADS_BIND=0-15 \
+  -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
+  -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
+  vllm_artemis:cpu --model "$MODEL" --host 0.0.0.0 --port 8000 \
+  --max-model-len 32768 --no-enable-prefix-caching \
+  --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1
+
+echo "waiting for server (Inductor compile may be slow on a cold cache)..."
+START=$(date +%s)
+while true; do
+  ELAPSED=$(( $(date +%s) - START ))
+  if [ $ELAPSED -ge $HEALTH_TIMEOUT ]; then
+    echo "FAILURE: server not healthy within ${HEALTH_TIMEOUT}s"; docker logs nw-artemis-server 2>&1 | tail -60; exit 1
+  fi
+  if [ "$(docker inspect -f '{{.State.Running}}' nw-artemis-server 2>/dev/null)" != "true" ]; then
+    echo "FAILURE: server container exited after ${ELAPSED}s"; docker logs nw-artemis-server 2>&1 | tail -60; exit 1
+  fi
+  curl -sf http://localhost:8000/health >/dev/null 2>&1 && { echo "server healthy after ${ELAPSED}s"; break; }
+  sleep 5
+done
+
+echo "replaying production trace (${DURATION}s at ${RATE}x)..."
+docker run --rm --network host -v "$NW_DIR:/nw" -w /nw ubuntu:24.04 \
+  ./nw-benchmark --trace-dir "$TRACE" --base-url http://localhost:8000/v1 \
+  --duration-seconds "$DURATION" --seed 42 --rate-multiplier "$RATE" --no-primer \
+  --out /nw/artemis_nw_raw.json
+BENCH_EXIT=$?
+[ $BENCH_EXIT -ne 0 ] && { echo "FAILURE: benchmark exit $BENCH_EXIT"; exit $BENCH_EXIT; }
+
+python3 - "$NW_DIR/artemis_nw_raw.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+out = {}
+for section in ("metrics", "replay"):
+    for k, v in (d.get(section) or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = v
+json.dump(out, open("artemis_results.json", "w"), indent=2)
+keys = ("output_tokens_per_second","avg_ttft_ms","avg_tpot_ms","total_requests","total_errors")
+print(json.dumps({k: out[k] for k in keys if k in out}, indent=2))
+PY
