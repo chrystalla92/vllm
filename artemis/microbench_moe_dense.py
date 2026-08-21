@@ -118,10 +118,17 @@ def main() -> int:
     print(f"  moe_prefill {res['moe_prefill']:.2f} ms   profile p90 ~19.70 ms")
     print(f"  moe_decode  {res['moe_decode']:.2f} ms   profile p50 ~4.49 ms")
 
-    out = {f"micro_{k}_ms": v for k, v in res.items()}
-    out["weighted_total_ms"] = fitness
-    out["fitness_inverse"] = 1000.0 / fitness  # higher-is-better form
-    json.dump(out, open("artemis_results.json", "w"), indent=2)
+    # Emit ONE metric only. Every numeric key in artemis_results.json becomes a
+    # fitness schema entry, and the score is a weighted blend across all of
+    # them: a previous run's schema had 21 entries at importances
+    # [0.6, 0.0267, 0.0133], so ~40% of fitness came from ancillary signals
+    # (compile_runtime, unit_test_runtime, memory). Rewarding low
+    # compile_runtime actively biases toward smaller, simpler changes.
+    # Concentrating on the single composite avoids that. The per-regime
+    # numbers are still printed above for humans and for the agent to read.
+    # (The alternative, metrics-schema set, requires metric UUIDs which the
+    # metrics endpoint does not currently expose.)
+    json.dump({"weighted_total_ms": fitness}, open("artemis_results.json", "w"), indent=2)
     return 0
 
 
