@@ -44,6 +44,10 @@ DURATION="${DURATION:-600}"
 RATE="${RATE:-3}"
 WARMUP="${WARMUP:-150}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-2400}"
+# Overridable so an ABBA can point successive arms at two different images
+# without rebuilding (and without clobbering the baseline tag that the
+# Artemis harness itself depends on).
+IMAGE="${IMAGE:-vllm_artemis:cpu}"
 
 mkdir -p "$COMPILE_CACHE"
 cleanup() { docker rm -f nw-artemis-server 2>/dev/null >/dev/null; rm -rf "$COMPILE_CACHE" 2>/dev/null; }
@@ -54,7 +58,7 @@ docker run -d --name nw-artemis-server --network host --ipc=host --privileged --
   -e HF_HOME=/hf -e VLLM_CPU_KVCACHE_SPACE=20 -e VLLM_CPU_OMP_THREADS_BIND=0-15 \
   -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
-  vllm_artemis:cpu --model "$MODEL" --host 0.0.0.0 --port 8000 \
+  "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
   --max-model-len 32768 --no-enable-prefix-caching \
   --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1
 
