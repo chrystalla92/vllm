@@ -22,7 +22,7 @@ set -uo pipefail
 #    reused across candidates; C++ kernel edits do not invalidate the graph,
 #    so this saves the compile on every candidate after the first.
 #
-#    *** CRITICAL: PRE-WARM THIS CACHE BEFORE CREATING A DISCOVERY RUN. ***
+#    *** SUPERSEDED: a shared persistent cache is NOT safe. ***
 #    A discovery run measures its baseline FIRST. On an empty cache the
 #    baseline pays the whole Inductor compile and every candidate inherits
 #    it, which is a systematic ~2% penalty against the baseline -- the
@@ -39,13 +39,14 @@ MODEL="${MODEL:-Qwen/Qwen3.6-35B-A3B}"
 NW_DIR="${NW_DIR:-/home/chrystalla/nw-benchmark-v1.0.0}"
 TRACE="${TRACE:-traces/Qwen3.6-35B-A3B_prod_2026-06-12_2h_filtered_24k}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/chrystalla/optimisation-orchestrator/.local/models}"
-COMPILE_CACHE="${COMPILE_CACHE:-/home/chrystalla/.cache/vllm-compile}"
+COMPILE_CACHE="$(mktemp -d /tmp/vllm-compile-XXXXXX)"   # FRESH per arm - see note above
 DURATION="${DURATION:-600}"
 RATE="${RATE:-3}"
+WARMUP="${WARMUP:-150}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-2400}"
 
 mkdir -p "$COMPILE_CACHE"
-cleanup() { docker rm -f nw-artemis-server 2>/dev/null >/dev/null; }
+cleanup() { docker rm -f nw-artemis-server 2>/dev/null >/dev/null; rm -rf "$COMPILE_CACHE" 2>/dev/null; }
 trap cleanup EXIT
 cleanup
 
@@ -70,6 +71,18 @@ while true; do
   curl -sf http://localhost:8000/health >/dev/null 2>&1 && { echo "server healthy after ${ELAPSED}s"; break; }
   sleep 5
 done
+
+# Warm-up replay. Its results are discarded. Its purpose is to trigger every
+# lazy Inductor shape compilation this trace provokes, so that the MEASURED
+# replay below runs compile-free. Without this, compilation leaks into the
+# measured window and depresses throughput by ~2% - which is larger than the
+# effects being measured and, because a run benchmarks its baseline first,
+# lands asymmetrically on the baseline.
+echo "warm-up replay (${WARMUP}s, results discarded)..."
+docker run --rm --network host -v "$NW_DIR:/nw" -w /nw ubuntu:24.04 \
+  ./nw-benchmark --trace-dir "$TRACE" --base-url http://localhost:8000/v1 \
+  --duration-seconds "$WARMUP" --seed 42 --rate-multiplier "$RATE" --no-primer \
+  --out /nw/artemis_nw_warmup.json >/dev/null 2>&1 || true
 
 echo "replaying production trace (${DURATION}s at ${RATE}x)..."
 docker run --rm --network host -v "$NW_DIR:/nw" -w /nw ubuntu:24.04 \
