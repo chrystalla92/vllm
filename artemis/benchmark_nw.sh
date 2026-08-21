@@ -21,6 +21,17 @@ set -uo pipefail
 #  - The torch.compile cache is mounted persistently so Inductor work is
 #    reused across candidates; C++ kernel edits do not invalidate the graph,
 #    so this saves the compile on every candidate after the first.
+#
+#    *** CRITICAL: PRE-WARM THIS CACHE BEFORE CREATING A DISCOVERY RUN. ***
+#    A discovery run measures its baseline FIRST. On an empty cache the
+#    baseline pays the whole Inductor compile and every candidate inherits
+#    it, which is a systematic ~2% penalty against the baseline -- the
+#    benchmark then rewards doing nothing. This voided an entire 10-version
+#    run (2026-08-21): a control on unmodified code with a warm cache scored
+#    46.24 against a 45.34 cold-cache baseline, beating six of seven
+#    "optimised" candidates. Warm it with one throwaway invocation of this
+#    script before `artemis discovery create`, or delete $COMPILE_CACHE so
+#    every arm is equally cold.
 #  - nw-benchmark needs GLIBC 2.38; this host has 2.36, so it runs inside
 #    ubuntu:24.04 with --network host.
 
