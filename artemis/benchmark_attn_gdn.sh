@@ -39,6 +39,7 @@ set -euo pipefail
 # load average lags and will read low while a runner is still busy.
 
 docker run --rm --entrypoint python3 \
+  --user "$(id -u):$(id -g)" \
   -e VLLM_CPU_SGL_KERNEL=1 -e OMP_NUM_THREADS=16 \
   -e MICROBENCH_REPS="${MICROBENCH_REPS:-20}" \
   -e MICROBENCH_ESTIMATOR="${MICROBENCH_ESTIMATOR:-median}" \

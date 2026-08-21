@@ -24,6 +24,7 @@ set -euo pipefail
 # the same code measured 34.8 / 25.9 / 21.5 ms for the same regime.
 
 docker run --rm --entrypoint python3 \
+  --user "$(id -u):$(id -g)" \
   -e VLLM_CPU_SGL_KERNEL=1 -e OMP_NUM_THREADS=16 \
   -e MICROBENCH_REPS="${MICROBENCH_REPS:-8}" \
   --cpuset-cpus 0-15 \

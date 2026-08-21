@@ -106,11 +106,36 @@ STATE_POOL = 256          # max_num_seqs: production sizes the GDN state pool
                           # different cache regime from a compact 42-row pool.
 
 # Profile shares (% of total CPU time). Attention split 57/43 prefill/decode.
-WEIGHTS = {
+# Each regime's share of TOTAL step CPU, from the production profile.
+SHARE = {
     "attn_prefill": 6.07,
     "attn_decode": 4.58,
     "gdn_update": 7.34,
     "gdn_chunk": 6.16,
+}
+
+# Per-regime times on STOCK code, measured on this host from a clean baseline
+# image. Used to convert each regime's measurement into a FRACTION of its own
+# baseline, so the composite predicts end-to-end impact.
+#
+# WHY THIS EXISTS - a real mistake, do not repeat it. The first version scored
+# `sum(time * share)`, which weights by ABSOLUTE MILLISECONDS and therefore
+# over-represents whichever regime is slowest per call. gdn_chunk is 6.16% of
+# step CPU but held 37% of that composite. A change that cut gdn_chunk 26%
+# scored -9.6% on the composite and looked like a major win; its true worth is
+# 0.26 * 6.16 = 1.6% of step CPU, below the ~3% trace-benchmark noise floor.
+# It duly measured ZERO end-to-end over an ABABAB at n=3 (exp-374). Two hours
+# of trace replay to discover the metric was lying about magnitude.
+#
+# These are a FIXED REFERENCE, so host drift shifts the absolute cpu_share_pct
+# (stock code read 22.86 against a nominal 24.15 on a fast evening). Only the
+# DIFFERENCE between two arms measured close together is meaningful - which is
+# the same discipline ABBA already enforces.
+BASELINE_MS = {
+    "attn_prefill": 5.21,
+    "attn_decode": 6.02,
+    "gdn_update": 1.02,
+    "gdn_chunk": 6.23,
 }
 
 # 20, not 8: at 8 reps the weighted total spread was 3.2% - no better than the
@@ -290,12 +315,22 @@ def main() -> int:
         "gdn_update": _time(_build_gdn_update(N_DECODE), reps=GDN_UPDATE_REPS),
         "gdn_chunk": _time(_build_gdn_chunk(M_PREFILL)),
     }
-    fitness = sum(res[k] * WEIGHTS[k] for k in res)
+    # Percent of TOTAL step CPU these four regimes consume, at the measured
+    # speeds. Each regime contributes (its time / its stock time) * its share,
+    # so a 26% cut in a regime worth 6.16% of the step moves this by 1.6 -
+    # directly comparable to what an end-to-end benchmark could show.
+    fitness = sum(res[k] / BASELINE_MS[k] * SHARE[k] for k in res)
+    stock = sum(SHARE.values())
 
-    print(f"{'regime':16s} {'ms/call':>10s} {'weight':>8s}")
+    print(f"{'regime':16s} {'ms/call':>10s} {'stock':>8s} {'share%':>8s} {'cpu%':>7s}")
     for k, v in res.items():
-        print(f"{k:16s} {v:10.3f} {WEIGHTS[k]:8.2f}")
-    print(f"\nweighted_total_ms {fitness:.3f}   (LOWER IS BETTER)")
+        print(f"{k:16s} {v:10.3f} {BASELINE_MS[k]:8.2f} {SHARE[k]:8.2f} "
+              f"{v / BASELINE_MS[k] * SHARE[k]:7.2f}")
+    print(f"\ncpu_share_pct {fitness:.3f}   (LOWER IS BETTER; stock = {stock:.2f})")
+    print(f"  => predicted end-to-end saving {stock - fitness:+.2f}% of step CPU")
+    if abs(stock - fitness) < 3.0:
+        print("  NOTE: under the ~3% end-to-end noise floor - would NOT be")
+        print("        provable on the production trace even if real.")
 
     print("\n-- shape validation vs production profile --")
     print(f"  attn_prefill {res['attn_prefill']:6.2f} ms   profile p90 ~6.05 ms (p99 38.8)")
@@ -303,7 +338,7 @@ def main() -> int:
     print(f"  gdn_update   {res['gdn_update']:6.2f} ms   profile p50 ~1.49 ms")
     print(f"  gdn_chunk    {res['gdn_chunk']:6.2f} ms   profile p50 ~5.85 ms")
 
-    json.dump({"weighted_total_ms": fitness}, open("artemis_results.json", "w"), indent=2)
+    json.dump({"cpu_share_pct": fitness}, open("artemis_results.json", "w"), indent=2)
     return 0
 
 
