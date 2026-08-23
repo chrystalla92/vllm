@@ -17,4 +17,15 @@ docker run --rm --entrypoint bash -e VLLM_CPU_SGL_KERNEL=1 \
      /tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py \
      /tests/v1/core/test_kv_cache_utils.py \
      /tests/v1/core/test_deferred_block_free.py \
+     -k 'not test_mla_with_incompatible_swa_uses_one_full_allocation_group' \
      -q --no-header -p no:cacheprovider"
+
+# The deselected test ERRORS on UNMODIFIED code in this environment - it covers
+# MLA with sliding-window attention, neither of which this model uses (it is
+# GDN + full attention). pytest exits non-zero on a collection error, so with
+# set -e it failed the baseline and killed an entire discovery run at 0/8
+# before a single candidate was measured. Filtered by test NAME rather than
+# --deselect because pytest resolves nodeids against its own rootdir here, so a
+# path-qualified deselect silently fails to match. The filter names the single
+# test, so any OTHER regression in this file still fails the gate.
+# Baseline: 202 passed, 1 deselected.
