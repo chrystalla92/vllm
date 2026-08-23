@@ -23,12 +23,28 @@ BASE_IMAGE="${BASE_IMAGE:-vllm-nw:base64}"
 OUT_IMAGE="${OUT_IMAGE:-vllm_artemis:cpu}"
 SITE=/opt/venv/lib/python3.12/site-packages/vllm
 
-# Refuse to run if compiled sources differ from the base image's commit.
-if ! git diff --quiet HEAD -- csrc/ CMakeLists.txt setup.py 2>/dev/null; then
-  echo "FAILURE: build_py.sh cannot be used - csrc/, CMakeLists.txt or setup.py"
-  echo "         is modified. Those need the full build (artemis/build.sh),"
-  echo "         otherwise the change is compiled out and reads as a false null."
-  git diff --stat HEAD -- csrc/ CMakeLists.txt setup.py
+# Refuse to run if compiled sources differ from what the base image was built
+# from. Checksum manifest rather than `git diff`: the Artemis runner unpacks a
+# plain directory with NO .git, so any git-based check fails closed and blocks
+# every build.
+MANIFEST="artemis/csrc.sha256"
+csrc_hash() {
+  find csrc CMakeLists.txt setup.py -type f 2>/dev/null \
+    | LC_ALL=C sort | xargs sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+if [ -f "$MANIFEST" ]; then
+  WANT="$(cut -d' ' -f1 < "$MANIFEST")"
+  GOT="$(csrc_hash)"
+  if [ "$WANT" != "$GOT" ]; then
+    echo "FAILURE: build_py.sh cannot be used - csrc/, CMakeLists.txt or setup.py"
+    echo "         differs from the base image ($GOT != $WANT)."
+    echo "         Compiled sources need the full build (artemis/build.sh);"
+    echo "         this fast path would compile them out, and the change would"
+    echo "         read as a false null rather than as an error."
+    exit 1
+  fi
+else
+  echo "FAILURE: $MANIFEST missing - cannot verify compiled sources are unchanged."
   exit 1
 fi
 
