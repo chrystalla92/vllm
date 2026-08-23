@@ -12,7 +12,23 @@ set -uo pipefail
 #  - --rate-multiplier 3: at rate 1.0 the CPU server keeps up and drains its
 #    queue, so Output tok/s is pinned by the trace and reads 0.00% for ANY
 #    engine change. 3x makes the server the bottleneck.
-#  - --no-enable-prefix-caching: cache hit ratio swings 0.905-1.486 across
+#  PREFIX CACHING IS ON HERE, DELIBERATELY, AND THAT CHANGES HOW TO READ THIS.
+#  The sibling benchmark_nw.sh disables it for measurement hygiene. This
+#  variant exists to optimise the cache itself, which is worth ~+14% on this
+#  trace (46.16 vs 40.44 tok/s) - an order of magnitude more than any kernel
+#  win found in four campaigns.
+#
+#  THE CATCH: hit ratio is ENDOGENOUS. It swung 0.905-1.486 across runs of the
+#  SAME code on the same trace and seed, because a faster server interleaves
+#  requests differently, which changes block residency, which changes the hit
+#  rate. So throughput here is noisier than the ~3% of the caching-off harness.
+#  Duration is raised to 900s to average over more requests, and cache_hit_ratio
+#  is printed alongside throughput. READ IT: if a candidate's throughput gain
+#  is accompanied by a large hit-ratio swing, suspect the lottery rather than
+#  the change, and re-run before believing it.
+#
+#  Historical note on the original comment this replaced:
+#  - --enable-prefix-caching: cache hit ratio swings 0.905-1.486 across
 #    runs of the same trace+seed (endogenous: engine speed changes request
 #    interleaving changes prefix residency). That variance would drown the
 #    signal. Deterministic proxy here; validate winners against the real
@@ -40,7 +56,7 @@ NW_DIR="${NW_DIR:-/home/chrystalla/nw-benchmark-v1.0.0}"
 TRACE="${TRACE:-traces/Qwen3.6-35B-A3B_prod_2026-06-12_2h_filtered_24k}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/chrystalla/optimisation-orchestrator/.local/models}"
 COMPILE_CACHE="$(mktemp -d /tmp/vllm-compile-XXXXXX)"   # FRESH per arm - see note above
-DURATION="${DURATION:-600}"
+DURATION="${DURATION:-900}"
 RATE="${RATE:-3}"
 WARMUP="${WARMUP:-150}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-2400}"
@@ -59,7 +75,7 @@ docker run -d --name nw-artemis-server --network host --ipc=host --privileged --
   -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
   "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
-  --max-model-len 32768 --no-enable-prefix-caching \
+  --max-model-len 32768 --enable-prefix-caching \
   --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1
 
 echo "waiting for server (Inductor compile may be slow on a cold cache)..."
