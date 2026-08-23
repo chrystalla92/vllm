@@ -41,9 +41,35 @@ H, I, E, TOPK = 2048, 512, 256, 8
 DTYPE = torch.bfloat16
 M_PREFILL, M_DECODE = 2048, 42
 
-# Share of each regime's calls in the production profile. MoE is bimodal with
-# roughly half its time in each mode; dense is dominated by its large calls.
-WEIGHTS = {"moe_prefill": 0.5, "moe_decode": 0.5, "dense_prefill": 0.61, "dense_decode": 0.39}
+# Each regime's share of TOTAL step CPU, from the production profile.
+# fused_experts_cpu is 46.10%, split ~50/50 between its two modes;
+# weight_packed_linear is 18.02%, split 61/39 (its large calls dominate).
+SHARE = {
+    "moe_prefill": 23.05,
+    "moe_decode": 23.05,
+    "dense_prefill": 10.99,
+    "dense_decode": 7.03,
+}
+
+# Per-regime times on STOCK code. Used to convert each measurement into a
+# FRACTION of its own baseline, so the composite predicts end-to-end impact.
+#
+# WHY THIS EXISTS - a real mistake, do not repeat it. The original scored
+# sum(time * share), which weights by ABSOLUTE MILLISECONDS and so
+# over-represents whichever regime is slowest per call. In the attention/GDN
+# companion that made a kernel worth 6.16% of step CPU hold 37% of fitness: a
+# 26% cut scored -9.6% and read as a major win, while its true worth was 1.6%
+# of step CPU, under the ~3% trace noise floor. It measured ZERO end-to-end
+# over an ABABAB at n=3 (exp-374). Same flaw, same fix, applied here.
+#
+# Fixed reference, so host drift shifts the absolute value; only the DIFFERENCE
+# between two arms measured close together is meaningful.
+BASELINE_MS = {
+    "moe_prefill": 21.02,
+    "moe_decode": 7.99,
+    "dense_prefill": 5.02,
+    "dense_decode": 0.281,
+}
 
 REPS = int(os.environ.get("MICROBENCH_REPS", "5"))
 WARMUP = int(os.environ.get("MICROBENCH_WARMUP", "2"))
@@ -106,12 +132,21 @@ def main() -> int:
         "dense_prefill": bench_dense(M_PREFILL),
         "dense_decode": bench_dense(M_DECODE),
     }
-    fitness = sum(res[k] * WEIGHTS[k] for k in res)
+    # Percent of TOTAL step CPU these four regimes consume, at the measured
+    # speeds. Each contributes (its time / its stock time) * its share, so a
+    # candidate's gain is directly comparable to an end-to-end result.
+    fitness = sum(res[k] / BASELINE_MS[k] * SHARE[k] for k in res)
+    stock = sum(SHARE.values())
 
-    print(f"{'regime':16s} {'ms/call':>10s} {'weight':>8s}")
+    print(f"{'regime':16s} {'ms/call':>10s} {'stock':>8s} {'share%':>8s} {'cpu%':>7s}")
     for k, v in res.items():
-        print(f"{k:16s} {v:10.3f} {WEIGHTS[k]:8.2f}")
-    print(f"\nweighted_total_ms {fitness:.3f}   (LOWER IS BETTER)")
+        print(f"{k:16s} {v:10.3f} {BASELINE_MS[k]:8.2f} {SHARE[k]:8.2f} "
+              f"{v / BASELINE_MS[k] * SHARE[k]:7.2f}")
+    print(f"\ncpu_share_pct {fitness:.3f}   (LOWER IS BETTER; stock = {stock:.2f})")
+    print(f"  => predicted end-to-end saving {stock - fitness:+.2f}% of step CPU")
+    if abs(stock - fitness) < 3.0:
+        print("  NOTE: under the ~3% end-to-end noise floor - would NOT be")
+        print("        provable on the production trace even if real.")
 
     # Sanity against the production profile
     print("\n-- shape validation vs production profile --")
@@ -128,7 +163,7 @@ def main() -> int:
     # numbers are still printed above for humans and for the agent to read.
     # (The alternative, metrics-schema set, requires metric UUIDs which the
     # metrics endpoint does not currently expose.)
-    json.dump({"weighted_total_ms": fitness}, open("artemis_results.json", "w"), indent=2)
+    json.dump({"cpu_share_pct": fitness}, open("artemis_results.json", "w"), indent=2)
     return 0
 
 
