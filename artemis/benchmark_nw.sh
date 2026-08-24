@@ -57,9 +57,11 @@ cleanup
 docker run -d --name nw-artemis-server --network host --ipc=host --privileged --shm-size 16g \
   -e HF_HOME=/hf -e VLLM_CPU_KVCACHE_SPACE=20 -e VLLM_CPU_OMP_THREADS_BIND=0-15 \
   -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
+  ${ADAPTIVE_BUDGET:+-e VLLM_ADAPTIVE_PREFILL_BUDGET=$ADAPTIVE_BUDGET} \
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
   "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
   ${MAX_BATCHED:+--max-num-batched-tokens $MAX_BATCHED} \
+  ${LONG_PREFILL_THRESHOLD:+--long-prefill-token-threshold $LONG_PREFILL_THRESHOLD} \
   --max-model-len 32768 --no-enable-prefix-caching \
   --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1
 
@@ -95,6 +97,9 @@ docker run --rm --network host -v "$NW_DIR:/nw" -w /nw ubuntu:24.04 \
   --duration-seconds "$DURATION" --seed 42 --rate-multiplier "$RATE" --no-primer \
   --out /nw/artemis_nw_raw.json
 BENCH_EXIT=$?
+# Preserve the server's own log before the exit trap removes the container
+# (run 11 lost agent instrumentation output to exactly this).
+docker logs nw-artemis-server > artemis_nw_server.log 2>&1 || true
 [ $BENCH_EXIT -ne 0 ] && { echo "FAILURE: benchmark exit $BENCH_EXIT"; exit $BENCH_EXIT; }
 
 python3 - "$NW_DIR/artemis_nw_raw.json" <<'PY'

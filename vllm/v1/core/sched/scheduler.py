@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -359,6 +360,17 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # EXPERIMENT (exp-378): decode-load-adaptive per-step prefill budget.
+        # "lo:hi:decode_hi" - interpolate the step token budget from hi (when
+        # no decodes would be stalled behind the prefill chunk) down to lo (at
+        # decode_hi or more active decodes). Off unless the env var is set.
+        _ab = os.environ.get("VLLM_ADAPTIVE_PREFILL_BUDGET")
+        self._adaptive_budget = (
+            tuple(int(x) for x in _ab.split(":")) if _ab else None
+        )
+        self._budget_log: dict[int, int] = {}
+        self._budget_log_step = 0
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -457,6 +469,23 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        if self._adaptive_budget is not None:
+            lo, hi, decode_hi = self._adaptive_budget
+            # Requests past prefill: each pays the full step latency per
+            # output token, so the more of them there are, the more a large
+            # prefill chunk costs in TPOT and the less budget we spend.
+            num_decodes = len(self.running) - len(self._inflight_prefills)
+            frac = min(1.0, max(0.0, num_decodes / decode_hi))
+            token_budget = max(lo, int(hi - (hi - lo) * frac) // 64 * 64)
+            self._budget_log[token_budget // 1024] = (
+                self._budget_log.get(token_budget // 1024, 0) + 1
+            )
+            self._budget_log_step += 1
+            if self._budget_log_step % 500 == 0:
+                logger.info(
+                    "adaptive budget histogram (KiT buckets): %s",
+                    dict(sorted(self._budget_log.items())),
+                )
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
