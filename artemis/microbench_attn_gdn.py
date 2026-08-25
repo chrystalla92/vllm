@@ -37,13 +37,15 @@ Measured calibration and repeatability (16 cores, quiet host, 3 runs)
   regime         measured   profile   ratio   run-to-run spread
   gdn_chunk        5.85 ms   5.85      1.00x   1.6%
   attn_prefill     4.96 ms   6.05(p90) 0.82x   2.1%
-  attn_decode      6.06 ms   3.87      1.57x   3.1%
+  attn_decode      3.03 ms   3.87      0.78x   3.1%  (post kv-split fix)
   gdn_update       0.98 ms   1.49      0.66x   4.7%
   weighted total  101 ms       -         -     1.35%
-All four land within ~1.6x of production, and the composite resolves changes
-well under the 3% end-to-end noise floor. attn_decode reads high because it
-uses the MEAN prompt length (6271) rather than the median (2813); the regime
-weights, not the absolute times, carry the profile share.
+All four land within ~1.3x of production, and the composite resolves changes
+well under the 3% end-to-end noise floor. (An earlier revision measured
+attn_decode at 6.06ms/1.57x: that was enable_kv_split=False disabling the
+scheduler's KV rebalancing - remainder sequences tail-load the last thread,
+up to 2.5x inflation at N % threads != 0. Production defaults the split ON;
+so does this benchmark now.)
 
 Two measurement decisions were forced by data, not taste:
   - The cache flush (see _flush_cache). Without it gdn_update read 0.42 ms,
@@ -133,7 +135,11 @@ SHARE = {
 # the same discipline ABBA already enforces.
 BASELINE_MS = {
     "attn_prefill": 5.21,
-    "attn_decode": 6.02,
+    # 3.03, not the earlier 6.02: that figure was measured with
+    # enable_kv_split=False (see the metadata call), which tail-loaded the
+    # scheduler and inflated this regime 2x. With the production setting the
+    # regime matches the profiled p50 (~3.87ms, mean-length contexts here).
+    "attn_decode": 3.03,
     "gdn_update": 1.02,
     "gdn_chunk": 6.23,
 }
@@ -233,7 +239,12 @@ def _build_attn(query_lens, kv_lens):
         causal=True,
         sliding_window_size=-1,
         isa=isa,
-        enable_kv_split=False,
+        # Production default (VLLM_CPU_ATTN_SPLIT_KV=1). With False the
+        # scheduler cannot rebalance KV across threads: remainder sequences
+        # tail-load the last thread and attn_decode inflates up to 2.5x at
+        # N % threads != 0 (measured: N=42 6.29ms vs 3.31ms; a phantom
+        # "sawtooth bug" that was really this flag).
+        enable_kv_split=True,
     )
     out = torch.empty_like(query)
     scale = HEAD_SIZE**-0.5
