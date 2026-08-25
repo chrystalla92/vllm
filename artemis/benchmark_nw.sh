@@ -61,6 +61,7 @@ docker run -d --name nw-artemis-server --network host --ipc=host --privileged --
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
   "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
   ${MAX_BATCHED:+--max-num-batched-tokens $MAX_BATCHED} \
+  ${SSM_DTYPE:+--mamba-ssm-cache-dtype $SSM_DTYPE} \
   ${LONG_PREFILL_THRESHOLD:+--long-prefill-token-threshold $LONG_PREFILL_THRESHOLD} \
   --max-model-len 32768 --no-enable-prefix-caching \
   --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1

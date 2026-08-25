@@ -46,4 +46,6 @@ docker run --rm --entrypoint python3 \
   --cpuset-cpus 0-15 \
   -v "$(pwd)/artemis/microbench_attn_gdn.py:/mb.py:ro" \
   -v "$(pwd):/out" -w /out \
-  vllm_artemis:cpu /mb.py
+  ${PV_SPANS:+-e VLLM_CPU_ATTN_PV_SPANS=$PV_SPANS} \
+  ${GDN_SCRATCH:+-e VLLM_CPU_GDN_SCRATCH=$GDN_SCRATCH} \
+  "${IMAGE:-vllm_artemis:cpu}" /mb.py

@@ -360,14 +360,33 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
-        # EXPERIMENT (exp-378): decode-load-adaptive per-step prefill budget.
-        # "lo:hi:decode_hi" - interpolate the step token budget from hi (when
-        # no decodes would be stalled behind the prefill chunk) down to lo (at
-        # decode_hi or more active decodes). Off unless the env var is set.
+        # EXPERIMENT (exp-378/exp-381): decode-load-adaptive per-step prefill
+        # budget. "lo:hi:decode_hi" interpolates the step token budget from hi
+        # (no decodes stalled behind the prefill chunk) down to lo (decode_hi
+        # or more active decodes). decode_hi may be "auto" = max_num_seqs / 4,
+        # which reproduces the exp-378 constant (64) at max_num_seqs=256 while
+        # scaling to other hosts instead of being tuned to this one.
+        # Optional 4th field selects the policy shape:
+        #   lin (default) - linear interpolation, the exp-378 winner
+        #   step          - hi below decode_hi/2, lo above decode_hi,
+        #                   previous budget held in between (hysteresis;
+        #                   avoids mid-size steps that pay both costs)
+        # Off unless the env var is set.
         _ab = os.environ.get("VLLM_ADAPTIVE_PREFILL_BUDGET")
-        self._adaptive_budget = (
-            tuple(int(x) for x in _ab.split(":")) if _ab else None
-        )
+        self._adaptive_budget = None
+        self._adaptive_policy = "lin"
+        if _ab:
+            parts = _ab.split(":")
+            lo, hi = int(parts[0]), int(parts[1])
+            decode_hi = (
+                max(16, self.max_num_running_reqs // 4)
+                if parts[2] == "auto"
+                else int(parts[2])
+            )
+            self._adaptive_budget = (lo, hi, decode_hi)
+            if len(parts) > 3:
+                self._adaptive_policy = parts[3]
+        self._adaptive_prev_budget = 0
         self._budget_log: dict[int, int] = {}
         self._budget_log_step = 0
 
@@ -475,8 +494,17 @@ class Scheduler(SchedulerInterface):
             # output token, so the more of them there are, the more a large
             # prefill chunk costs in TPOT and the less budget we spend.
             num_decodes = len(self.running) - len(self._inflight_prefills)
-            frac = min(1.0, max(0.0, num_decodes / decode_hi))
-            token_budget = max(lo, int(hi - (hi - lo) * frac) // 64 * 64)
+            if self._adaptive_policy == "step":
+                if num_decodes <= decode_hi // 2:
+                    token_budget = hi
+                elif num_decodes >= decode_hi:
+                    token_budget = lo
+                else:
+                    token_budget = self._adaptive_prev_budget or hi
+            else:
+                frac = min(1.0, max(0.0, num_decodes / decode_hi))
+                token_budget = max(lo, int(hi - (hi - lo) * frac) // 64 * 64)
+            self._adaptive_prev_budget = token_budget
             self._budget_log[token_budget // 1024] = (
                 self._budget_log.get(token_budget // 1024, 0) + 1
             )

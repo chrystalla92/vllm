@@ -73,9 +73,11 @@ cleanup
 docker run -d --name nw-artemis-server --network host --ipc=host --privileged --shm-size 16g \
   -e HF_HOME=/hf -e VLLM_CPU_KVCACHE_SPACE=20 -e VLLM_CPU_OMP_THREADS_BIND=0-15 \
   -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
+  ${ADAPTIVE_BUDGET:+-e VLLM_ADAPTIVE_PREFILL_BUDGET=$ADAPTIVE_BUDGET} \
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
   "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
   ${PREFIX_MATCH_UNIT:+--prefix-match-unit $PREFIX_MATCH_UNIT} \
+  ${MAX_BATCHED:+--max-num-batched-tokens $MAX_BATCHED} \
   --max-model-len 32768 --enable-prefix-caching \
   --enable-prompt-tokens-details --language-model-only >/dev/null 2>&1
 
