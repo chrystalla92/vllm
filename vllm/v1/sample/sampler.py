@@ -2,12 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import os
+
 import torch
 import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -15,6 +22,13 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
+
+logger = init_logger(__name__)
+
+# 0 = off, 1 = use the vectorized CPU argmax kernel for greedy sampling,
+# 2 = additionally sample straight from the model-dtype logits (skipping the
+# fp32 copy) when nothing else in the sampler needs them.
+_CPU_FAST_GREEDY = int(os.environ.get("VLLM_CPU_FAST_GREEDY", "0"))
 
 
 class Sampler(nn.Module):
@@ -91,6 +105,24 @@ class Sampler(nn.Module):
                     raw_logprobs = logits.clone()
                 else:
                     raw_logprobs = logits.to(torch.float32)
+
+        if (
+            _CPU_FAST_GREEDY >= 2
+            and sampling_metadata.all_greedy
+            and num_logprobs is None
+            and not sampling_metadata.logprob_token_ids
+            and logits.device.type == "cpu"
+            and self._greedy_fast_path_safe(sampling_metadata)
+        ):
+            logger.info_once(
+                "VLLM_CPU_FAST_GREEDY=2: sampling directly from %s logits",
+                logits.dtype,
+            )
+            sampled = self.greedy_sample(logits)
+            return SamplerOutput(
+                sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
+                logprobs_tensors=None,
+            )
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
@@ -238,7 +270,40 @@ class Sampler(nn.Module):
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+        if (
+            _CPU_FAST_GREEDY
+            and logits.device.type == "cpu"
+            and logits.dtype in (torch.float32, torch.bfloat16)
+            and logits.is_contiguous()
+        ):
+            logger.info_once("VLLM_CPU_FAST_GREEDY: greedy_sample_argmax kernel engaged")
+            return torch.ops._C.greedy_sample_argmax(logits).view(-1)
         return logits.argmax(dim=-1).view(-1)
+
+    @staticmethod
+    def _greedy_fast_path_safe(sampling_metadata: SamplingMetadata) -> bool:
+        """True when greedy sampling from the model-dtype logits is exact:
+        no active processor, penalty, or mask would modify the fp32 logits
+        before argmax."""
+        if (
+            sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or not sampling_metadata.no_penalties
+        ):
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        for proc in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if isinstance(proc, LogitBiasLogitsProcessor):
+                if proc.biases:
+                    return False
+            elif isinstance(proc, MinTokensLogitsProcessor):
+                if proc.min_toks:
+                    return False
+            else:
+                return False
+        return True
 
     def sample(
         self,

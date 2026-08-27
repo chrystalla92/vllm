@@ -1,6 +1,9 @@
 #include "cpu_types.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <utility>
+#include <vector>
 
 namespace cpu_utils {
 
@@ -487,6 +490,169 @@ void sample_recovered_tokens_kernel_impl(
       out_ptr[token_idx] = best_id;
     }
   }
+}
+
+namespace {
+
+// Per-chunk argmax returning (max value as float, index of its first
+// occurrence within the chunk). Strict `>` comparisons keep the first
+// occurrence, matching aten::argmax on CPU for NaN-free input; NaN inputs
+// are ignored rather than propagated (logits are NaN-free by construction).
+template <typename scalar_t>
+std::pair<float, int64_t> chunk_argmax_scalar(const scalar_t* p, int64_t n) {
+  float best = -std::numeric_limits<float>::infinity();
+  int64_t best_i = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    float v = static_cast<float>(p[i]);
+    if (v > best) {
+      best = v;
+      best_i = i;
+    }
+  }
+  return {best, best_i};
+}
+
+#if defined(__AVX512F__)
+
+// Horizontal finish for a lane-wise running (max, first-index) pair: the
+// global first occurrence is the smallest recorded index among lanes that
+// hold the global max.
+inline std::pair<float, int64_t> hreduce_argmax(__m512 vmax, __m512i vidx) {
+  float maxv = _mm512_reduce_max_ps(vmax);
+  __mmask16 eq = _mm512_cmp_ps_mask(vmax, _mm512_set1_ps(maxv), _CMP_EQ_OQ);
+  __m512i cand = _mm512_mask_mov_epi32(
+      _mm512_set1_epi32(std::numeric_limits<int32_t>::max()), eq, vidx);
+  return {maxv, _mm512_reduce_min_epi32(cand)};
+}
+
+inline void lane_update(__m512 v, __m512i cur, __m512& vmax, __m512i& vidx) {
+  __mmask16 m = _mm512_cmp_ps_mask(v, vmax, _CMP_GT_OQ);
+  vmax = _mm512_mask_mov_ps(vmax, m, v);
+  vidx = _mm512_mask_mov_epi32(vidx, m, cur);
+}
+
+std::pair<float, int64_t> chunk_argmax(const float* p, int64_t n) {
+  __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+  __m512i vidx = _mm512_setzero_si512();
+  __m512i cur = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                  13, 14, 15);
+  const __m512i step = _mm512_set1_epi32(16);
+  int64_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    lane_update(_mm512_loadu_ps(p + i), cur, vmax, vidx);
+    cur = _mm512_add_epi32(cur, step);
+  }
+  auto [best, best_i] = hreduce_argmax(vmax, vidx);
+  for (; i < n; ++i) {
+    if (p[i] > best) {
+      best = p[i];
+      best_i = i;
+    }
+  }
+  return {best, best_i};
+}
+
+// bf16 -> fp32 widening via zero-extend + shift; no AVX512-BF16 needed.
+inline __m512 bf16_to_ps(__m256i x) {
+  return _mm512_castsi512_ps(
+      _mm512_slli_epi32(_mm512_cvtepu16_epi32(x), 16));
+}
+
+std::pair<float, int64_t> chunk_argmax(const at::BFloat16* p, int64_t n) {
+  const uint16_t* u = reinterpret_cast<const uint16_t*>(p);
+  __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+  __m512i vidx = _mm512_setzero_si512();
+  __m512i cur = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                  13, 14, 15);
+  const __m512i step = _mm512_set1_epi32(16);
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512i raw = _mm512_loadu_si512(u + i);
+    lane_update(bf16_to_ps(_mm512_castsi512_si256(raw)), cur, vmax, vidx);
+    cur = _mm512_add_epi32(cur, step);
+    lane_update(bf16_to_ps(_mm512_extracti64x4_epi64(raw, 1)), cur, vmax,
+                vidx);
+    cur = _mm512_add_epi32(cur, step);
+  }
+  auto [best, best_i] = hreduce_argmax(vmax, vidx);
+  for (; i < n; ++i) {
+    float v = static_cast<float>(p[i]);
+    if (v > best) {
+      best = v;
+      best_i = i;
+    }
+  }
+  return {best, best_i};
+}
+
+#else
+
+template <typename scalar_t>
+std::pair<float, int64_t> chunk_argmax(const scalar_t* p, int64_t n) {
+  return chunk_argmax_scalar(p, n);
+}
+
+#endif
+
+template <typename scalar_t>
+void greedy_argmax_typed(const scalar_t* logits, int64_t num_seqs,
+                         int64_t vocab_size, int64_t* out) {
+  // Two-level reduction: chunks expose num_seqs * num_chunks independent
+  // tasks so small batches still fill the machine.
+  constexpr int64_t CHUNK = 16384;
+  const int64_t num_chunks = (vocab_size + CHUNK - 1) / CHUNK;
+  std::vector<float> cmax(num_seqs * num_chunks);
+  std::vector<int64_t> cidx(num_seqs * num_chunks);
+
+#pragma omp parallel for collapse(2)
+  for (int64_t s = 0; s < num_seqs; ++s) {
+    for (int64_t c = 0; c < num_chunks; ++c) {
+      const int64_t begin = c * CHUNK;
+      const int64_t len = std::min(CHUNK, vocab_size - begin);
+      auto [v, i] = chunk_argmax(logits + s * vocab_size + begin, len);
+      cmax[s * num_chunks + c] = v;
+      cidx[s * num_chunks + c] = begin + i;
+    }
+  }
+
+  for (int64_t s = 0; s < num_seqs; ++s) {
+    float best = cmax[s * num_chunks];
+    int64_t best_i = cidx[s * num_chunks];
+    for (int64_t c = 1; c < num_chunks; ++c) {
+      if (cmax[s * num_chunks + c] > best) {
+        best = cmax[s * num_chunks + c];
+        best_i = cidx[s * num_chunks + c];
+      }
+    }
+    out[s] = best_i;
+  }
+}
+
+}  // namespace
+
+torch::Tensor greedy_sample_argmax_kernel_impl(const torch::Tensor& logits) {
+  TORCH_CHECK(logits.dim() == 2, "greedy_sample_argmax: logits must be 2D");
+  TORCH_CHECK(logits.is_contiguous(),
+              "greedy_sample_argmax: logits must be contiguous");
+  const int64_t num_seqs = logits.size(0);
+  const int64_t vocab_size = logits.size(1);
+  auto out = torch::empty({num_seqs},
+                          logits.options().dtype(torch::kInt64));
+  int64_t* out_ptr = out.data_ptr<int64_t>();
+  switch (logits.scalar_type()) {
+    case torch::kFloat:
+      greedy_argmax_typed(logits.data_ptr<float>(), num_seqs, vocab_size,
+                          out_ptr);
+      break;
+    case torch::kBFloat16:
+      greedy_argmax_typed(logits.data_ptr<at::BFloat16>(), num_seqs,
+                          vocab_size, out_ptr);
+      break;
+    default:
+      TORCH_CHECK(false, "greedy_sample_argmax: unsupported dtype ",
+                  logits.scalar_type());
+  }
+  return out;
 }
 
 }  // namespace cpu_utils

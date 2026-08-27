@@ -305,6 +305,7 @@ void rejection_greedy_sample_kernel_impl(
     const torch::Tensor& draft_token_ids, const torch::Tensor& target_argmax,
     const torch::Tensor& bonus_token_ids,
     const std::optional<torch::Tensor>& is_greedy, const int64_t max_spec_len);
+torch::Tensor greedy_sample_argmax_kernel_impl(const torch::Tensor& logits);
 void rejection_random_sample_kernel_impl(
     torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
     const torch::Tensor& draft_token_ids,
@@ -747,6 +748,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor bonus_token_ids, Tensor? is_greedy, "
       "SymInt max_spec_len) -> ()",
       &cpu_utils::rejection_greedy_sample_kernel_impl);
+  ops.def("greedy_sample_argmax(Tensor logits) -> Tensor",
+          &cpu_utils::greedy_sample_argmax_kernel_impl);
   ops.def(
       "rejection_random_sample_kernel_impl("
       "Tensor(a0!) output_token_ids, Tensor cu_num_draft_tokens, "
