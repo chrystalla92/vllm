@@ -1,7 +1,11 @@
 #include "cpu_types.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <limits>
+#include <mutex>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -629,6 +633,135 @@ void greedy_argmax_typed(const scalar_t* logits, int64_t num_seqs,
 }
 
 }  // namespace
+
+namespace {
+
+// Insert (v, id) into the descending top-k arrays if it beats the current
+// k-th value. Strict `>` keeps earlier indices ahead on ties, matching
+// aten::topk's first-occurrence preference.
+template <int64_t MAX_K>
+inline void topk_insert(float v, int32_t id, float* vals, int32_t* ids,
+                        int64_t k) {
+  if (v <= vals[k - 1]) return;
+  int64_t j = k - 1;
+  while (j > 0 && v > vals[j - 1]) {
+    vals[j] = vals[j - 1];
+    ids[j] = ids[j - 1];
+    --j;
+  }
+  vals[j] = v;
+  ids[j] = id;
+}
+
+template <typename scalar_t>
+void topk_softmax_row(const scalar_t* row, int64_t num_experts, int64_t k,
+                      float* out_w, int32_t* out_id) {
+  constexpr int64_t MAX_K = 32;
+  float vals[MAX_K];
+  int32_t ids[MAX_K];
+  for (int64_t i = 0; i < k; ++i) {
+    vals[i] = -std::numeric_limits<float>::infinity();
+    ids[i] = 0;
+  }
+
+  int64_t e = 0;
+#if defined(__AVX512F__)
+  // Vector pre-filter: only elements beating the running k-th value need
+  // the scalar insertion path (rare after warm-up: ~k*ln(E/k) hits).
+  for (; e + 16 <= num_experts; e += 16) {
+    __m512 v;
+    if constexpr (std::is_same_v<scalar_t, float>) {
+      v = _mm512_loadu_ps(row + e);
+    } else {
+      v = bf16_to_ps(_mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(row + e)));
+    }
+    __mmask16 m = _mm512_cmp_ps_mask(v, _mm512_set1_ps(vals[k - 1]),
+                                     _CMP_GT_OQ);
+    if (m == 0) continue;
+    alignas(64) float buf[16];
+    _mm512_store_ps(buf, v);
+    for (int64_t l = 0; l < 16; ++l) {
+      if (m & (static_cast<__mmask16>(1) << l)) {
+        topk_insert<MAX_K>(buf[l], static_cast<int32_t>(e + l), vals, ids, k);
+      }
+    }
+  }
+#endif
+  for (; e < num_experts; ++e) {
+    topk_insert<MAX_K>(static_cast<float>(row[e]), static_cast<int32_t>(e),
+                       vals, ids, k);
+  }
+
+  // Renormalizing softmax over the selected k, summed in descending-value
+  // order (deterministic; differs from aten's arbitrary sorted=False order
+  // by <=1ulp in the weights).
+  const float mx = vals[0];
+  float sum = 0.0f;
+  float ex[MAX_K];
+  for (int64_t i = 0; i < k; ++i) {
+    ex[i] = std::exp(vals[i] - mx);
+    sum += ex[i];
+  }
+  const float inv = 1.0f / sum;
+  for (int64_t i = 0; i < k; ++i) {
+    float w = ex[i] * inv;
+    // Match the stock path bit-for-bit where possible: torch.softmax on a
+    // bf16 tensor rounds its output to bf16 before the fp32 cast.
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      w = static_cast<float>(static_cast<at::BFloat16>(w));
+    }
+    out_w[i] = w;
+    out_id[i] = ids[i];
+  }
+}
+
+}  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> moe_topk_softmax_kernel_impl(
+    const torch::Tensor& router_logits, const int64_t topk) {
+  TORCH_CHECK(router_logits.dim() == 2 && router_logits.is_contiguous(),
+              "moe_topk_softmax: logits must be 2D contiguous");
+  TORCH_CHECK(topk >= 1 && topk <= 32 && topk <= router_logits.size(1),
+              "moe_topk_softmax: unsupported topk ", topk);
+  const int64_t num_tokens = router_logits.size(0);
+  const int64_t num_experts = router_logits.size(1);
+  auto weights = torch::empty({num_tokens, topk},
+                              router_logits.options().dtype(torch::kFloat));
+  auto ids = torch::empty({num_tokens, topk},
+                          router_logits.options().dtype(torch::kInt32));
+  float* w_ptr = weights.data_ptr<float>();
+  int32_t* id_ptr = ids.data_ptr<int32_t>();
+
+  // One-time engagement log on stderr: select_experts runs inside the
+  // torch.compile graph where python-side logging is not traceable.
+  static std::once_flag engaged_once;
+  std::call_once(engaged_once, [&] {
+    fprintf(stderr, "[moe-topk-softmax] engaged: E=%ld k=%ld dtype=%s\n",
+            static_cast<long>(num_experts), static_cast<long>(topk),
+            toString(router_logits.scalar_type()));
+  });
+
+  auto run = [&](auto* logits_ptr) {
+#pragma omp parallel for
+    for (int64_t t = 0; t < num_tokens; ++t) {
+      topk_softmax_row(logits_ptr + t * num_experts, num_experts, topk,
+                       w_ptr + t * topk, id_ptr + t * topk);
+    }
+  };
+  switch (router_logits.scalar_type()) {
+    case torch::kFloat:
+      run(router_logits.data_ptr<float>());
+      break;
+    case torch::kBFloat16:
+      run(router_logits.data_ptr<at::BFloat16>());
+      break;
+    default:
+      TORCH_CHECK(false, "moe_topk_softmax: unsupported dtype ",
+                  router_logits.scalar_type());
+  }
+  return {weights, ids};
+}
 
 torch::Tensor greedy_sample_argmax_kernel_impl(const torch::Tensor& logits) {
   TORCH_CHECK(logits.dim() == 2, "greedy_sample_argmax: logits must be 2D");

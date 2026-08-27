@@ -59,6 +59,7 @@ docker run -d --name nw-artemis-server --network host --ipc=host --privileged --
   -e VLLM_CPU_SGL_KERNEL=1 -e VLLM_CACHE_ROOT=/compile-cache \
   ${ADAPTIVE_BUDGET:+-e VLLM_ADAPTIVE_PREFILL_BUDGET=$ADAPTIVE_BUDGET} \
   ${FAST_GREEDY:+-e VLLM_CPU_FAST_GREEDY=$FAST_GREEDY} \
+  ${FUSED_ROUTER:+-e VLLM_CPU_FUSED_ROUTER=$FUSED_ROUTER} \
   -v "$HF_CACHE_DIR:/hf" -v "$COMPILE_CACHE:/compile-cache" \
   "$IMAGE" --model "$MODEL" --host 0.0.0.0 --port 8000 \
   ${MAX_BATCHED:+--max-num-batched-tokens $MAX_BATCHED} \

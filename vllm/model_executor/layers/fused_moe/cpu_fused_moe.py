@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import weakref
 from collections.abc import Callable
 
@@ -18,6 +19,23 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.layer_utils import replace_parameter
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# 1 = fuse the non-grouped softmax routing path (topk + softmax + casts)
+# into a single C++ op. Default off.
+_CPU_FUSED_ROUTER = int(os.environ.get("VLLM_CPU_FUSED_ROUTER", "0"))
+
+if _CPU_FUSED_ROUTER and hasattr(torch.ops._C, "moe_topk_softmax"):
+    # select_experts runs inside the torch.compile graph; without a fake
+    # impl Dynamo executes the real kernel on unallocated fake tensors.
+    @torch.library.register_fake("_C::moe_topk_softmax")
+    def _moe_topk_softmax_fake(
+        router_logits: torch.Tensor, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = router_logits.shape[0]
+        return (
+            router_logits.new_empty((num_tokens, topk), dtype=torch.float32),
+            router_logits.new_empty((num_tokens, topk), dtype=torch.int32),
+        )
 
 _CPU_MOE_LAYER_CACHE = {}
 # The CPU grouped-gemm MoE kernels (AMX and vector) tile the expert
@@ -153,6 +171,16 @@ def select_experts(
         )
     elif custom_routing_function is None:
         assert scoring_func == "softmax"
+        if (
+            _CPU_FUSED_ROUTER
+            and renormalize
+            and router_logits.dtype in (torch.float32, torch.bfloat16)
+            and router_logits.is_contiguous()
+        ):
+            # No logging here: this runs inside the torch.compile graph and
+            # Dynamo rejects Logger methods. The kernel emits a one-time
+            # stderr line instead ("[moe-topk-softmax] engaged").
+            return torch.ops._C.moe_topk_softmax(router_logits, top_k)
         topk_logit_vals, topk_idx = torch.topk(
             router_logits, k=top_k, dim=-1, sorted=False
         )
